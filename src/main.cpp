@@ -21,6 +21,12 @@ constexpr uint16_t kMaxBrakePressureBar = 120;
 constexpr uint32_t kBrakeRampMs = 10000;
 constexpr uint16_t kStatusLogIntervalMs = 10000;
 constexpr uint8_t kLedPin = 5;
+constexpr uint8_t kLedPwmChannel = 0;
+constexpr uint16_t kLedPwmFrequencyHz = 1000;
+constexpr uint8_t kLedPwmResolutionBits = 8;
+constexpr uint16_t kLedPwmMaxDuty = (1U << kLedPwmResolutionBits) - 1;
+constexpr uint16_t kLedThrottleMaxDuty = 180;
+constexpr float kLedThrottleGamma = 1.7F;
 constexpr uint16_t kLedFastBlinkIntervalMs = 100;
 constexpr uint16_t kLedLongBlinkOnMs = 700;
 constexpr uint16_t kLedLongBlinkOffMs = 350;
@@ -28,6 +34,7 @@ constexpr uint16_t kLedConnectedBlinkOnMs = 100;
 constexpr uint16_t kLedConnectedBlinkIntervalMs = 5000;
 constexpr uint16_t kLedDisconnectedBlinkOnMs = 700;
 constexpr uint16_t kLedDisconnectedBlinkIntervalMs = 2000;
+constexpr float kLedThrottleThresholdPercent = 1.0F;
 constexpr uint8_t kAdcSdaPin = 19;
 constexpr uint8_t kAdcSclPin = 22;
 constexpr uint32_t kAdcI2cClockHz = 100000;
@@ -82,6 +89,7 @@ bool throttleCalibrationPrefsReady = false;
 bool ledOn = false;
 bool ledIdleBlinkOn = false;
 bool ledIdleConnected = false;
+bool ledThrottleActive = false;
 
 uint16_t readUint16Be(const uint8_t *data) {
   return (static_cast<uint16_t>(data[0]) << 8) | data[1];
@@ -278,9 +286,22 @@ void updateThrottleFromAdc(uint32_t now) {
   updateThrottleAdcState(rawValue, volts, false);
 }
 
+void setLedDuty(uint16_t duty) {
+  duty = min<uint16_t>(duty, kLedPwmMaxDuty);
+  ledOn = duty > 0;
+  ledcWrite(kLedPwmChannel, duty);
+}
+
 void setLed(bool on) {
-  ledOn = on;
-  digitalWrite(kLedPin, ledOn ? HIGH : LOW);
+  setLedDuty(on ? kLedPwmMaxDuty : 0);
+}
+
+uint16_t throttlePercentToLedDuty(float percent) {
+  percent = constrain(percent, 0.0F, 100.0F);
+  const float normalized = percent / 100.0F;
+  return static_cast<uint16_t>(
+      lroundf(powf(normalized, kLedThrottleGamma) *
+              static_cast<float>(kLedThrottleMaxDuty)));
 }
 
 void startLedFastBlink(uint32_t now) {
@@ -317,6 +338,21 @@ void startLedIdleBlink(uint32_t now) {
 }
 
 void updateLedIdleBlink(uint32_t now) {
+  if (throttleAdcValid && throttlePercent > kLedThrottleThresholdPercent) {
+    ledThrottleActive = true;
+    ledIdleBlinkOn = false;
+    setLedDuty(throttlePercentToLedDuty(throttlePercent));
+    return;
+  }
+
+  if (ledThrottleActive) {
+    ledThrottleActive = false;
+    ledIdleBlinkOn = false;
+    lastLedIdleBlinkMs = now;
+    setLed(false);
+    return;
+  }
+
   const bool connected = bleClientConnected;
   const uint16_t blinkOnMs =
       connected ? kLedConnectedBlinkOnMs : kLedDisconnectedBlinkOnMs;
@@ -800,7 +836,8 @@ void startRaceChronoBle() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(kLedPin, OUTPUT);
+  ledcSetup(kLedPwmChannel, kLedPwmFrequencyHz, kLedPwmResolutionBits);
+  ledcAttachPin(kLedPin, kLedPwmChannel);
   setLed(false);
 
   Serial.println();
@@ -821,8 +858,8 @@ void loop() {
   const uint32_t now = millis();
   const float brakePressureBar = emulateBrakePressure(now);
 
-  updateLedIdleBlink(now);
   updateThrottleFromAdc(now);
+  updateLedIdleBlink(now);
 
   if (bleClientConnected && now - lastCanNotifyMs >= notifyIntervalMs) {
     lastCanNotifyMs = now;
