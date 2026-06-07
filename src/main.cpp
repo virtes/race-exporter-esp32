@@ -17,6 +17,7 @@ constexpr uint32_t kBrakePressurePid = 0x00000101;
 constexpr uint32_t kThrottlePositionPid = 0x00000102;
 constexpr uint32_t kBatteryVoltagePid = 0x00000103;
 constexpr uint32_t kEngineRpmPid = 0x00000104;
+constexpr uint32_t kAfrPid = 0x00000105;
 constexpr uint16_t kDefaultNotifyIntervalMs = 20;
 constexpr uint16_t kBleTxLogIntervalMs = 5000;
 constexpr uint16_t kMaxBrakePressureBar = 250;
@@ -48,8 +49,10 @@ constexpr uint16_t kAdcMissingLogIntervalMs = 5000;
 constexpr float kAds1115VoltsPerBit = 6.144F / 32768.0F;
 constexpr uint8_t kThrottleAdcChannel = 0;
 constexpr uint8_t kBrakePressureAdcChannel = 1;
+constexpr uint8_t kAfrAdcChannel = 2;
 constexpr uint16_t kThrottleAdcReadIntervalMs = 20;
 constexpr uint16_t kBrakePressureAdcReadIntervalMs = 20;
+constexpr uint16_t kAfrAdcReadIntervalMs = 20;
 constexpr uint8_t kBatteryAdcPin = 34;
 constexpr uint8_t kBatteryAdcResolutionBits = 12;
 constexpr uint16_t kBatteryAdcReadIntervalMs = 1000;
@@ -58,7 +61,13 @@ constexpr uint8_t kTachInputPin = 27;
 constexpr float kIgnitionPulsesPerRevolution = 1.0F;
 constexpr uint16_t kTachMinPulseIntervalUs = 1000;
 constexpr uint16_t kTachSignalTimeoutMs = 1000;
-constexpr float kEngineRpmFilterAlpha = 0.35F;
+constexpr uint8_t kTachPeriodSampleCount = 3;
+constexpr uint16_t kTachCountWindowMs = 200;
+constexpr uint8_t kTachCountWindowMinPulses = 4;
+constexpr float kTachCountWindowMinRpm = 1800.0F;
+constexpr float kTachWindowBlend = 0.35F;
+constexpr float kEngineRpmRiseFilterAlpha = 0.35F;
+constexpr float kEngineRpmFallFilterAlpha = 0.75F;
 constexpr uint16_t kThrottleZeroCalibrationMs = 1000;
 constexpr uint16_t kThrottleOpenCalibrationPauseMs = 2000;
 constexpr uint16_t kThrottleOpenCalibrationMs = 2000;
@@ -80,6 +89,9 @@ constexpr float kBrakePressureFullVolts =
 constexpr float kBrakePressureHoldDeadbandBar = 0.25F;
 constexpr float kBatteryDividerMultiplier = 1.951091F;
 constexpr float kBatteryAdcFilterAlpha = 0.2F;
+constexpr float kAfrDividerMultiplier = 2.0F;
+constexpr float kAfrAtZeroVolts = 10.0F;
+constexpr float kAfrAtFiveVolts = 20.0F;
 constexpr char kThrottleCalibrationPrefsNamespace[] = "throttle";
 constexpr char kThrottleZeroPrefsKey[] = "zero_v";
 constexpr char kThrottleFullPrefsKey[] = "full_v";
@@ -95,6 +107,7 @@ bool brakePressurePidAllowed = true;
 bool throttlePositionPidAllowed = true;
 bool batteryVoltagePidAllowed = true;
 bool engineRpmPidAllowed = true;
+bool afrPidAllowed = true;
 uint16_t notifyIntervalMs = kDefaultNotifyIntervalMs;
 uint32_t lastCanNotifyMs = 0;
 uint32_t lastBleTxLogMs = 0;
@@ -106,6 +119,7 @@ uint32_t lastAdcMissingLogMs = 0;
 uint32_t lastThrottleAdcReadMs = 0;
 uint32_t lastBrakePressureAdcReadMs = 0;
 uint32_t lastBatteryAdcReadMs = 0;
+uint32_t lastAfrAdcReadMs = 0;
 uint8_t adcI2cAddress = 0;
 int16_t throttleAdcRaw = 0;
 float throttleAdcVolts = 0.0F;
@@ -121,6 +135,11 @@ float brakePressureAdcVolts = 0.0F;
 float brakePressureBar = 0.0F;
 bool brakePressureAdcValid = false;
 bool brakePressureFilterInitialized = false;
+int16_t afrAdcRaw = 0;
+float afrAdcVolts = 0.0F;
+float afrSignalVolts = 0.0F;
+float afr = kAfrAtZeroVolts;
+bool afrAdcValid = false;
 int16_t batteryAdcRaw = 0;
 float batteryAdcVolts = 0.0F;
 float batteryMeasuredVolts = 0.0F;
@@ -130,10 +149,17 @@ bool batteryFilterInitialized = false;
 volatile uint32_t tachLastPulseUs = 0;
 volatile uint32_t tachPulseIntervalUs = 0;
 volatile uint32_t tachPulseCount = 0;
+volatile uint32_t tachPulseIntervalsUs[kTachPeriodSampleCount] = {};
+volatile uint8_t tachPulseIntervalIndex = 0;
+volatile uint8_t tachPulseIntervalSamples = 0;
 float engineRpm = 0.0F;
 bool engineRpmValid = false;
 bool engineRpmFilterInitialized = false;
 uint32_t lastTachPulseCount = 0;
+uint32_t lastTachWindowPulseCount = 0;
+uint32_t lastTachWindowUs = 0;
+float tachWindowRpm = 0.0F;
+bool tachWindowRpmValid = false;
 bool ledOn = false;
 bool ledIdleBlinkOn = false;
 bool ledIdleConnected = false;
@@ -155,6 +181,12 @@ void IRAM_ATTR handleTachPulse() {
 
   tachLastPulseUs = nowUs;
   tachPulseIntervalUs = intervalUs;
+  tachPulseIntervalsUs[tachPulseIntervalIndex] = intervalUs;
+  tachPulseIntervalIndex =
+      (tachPulseIntervalIndex + 1) % kTachPeriodSampleCount;
+  if (tachPulseIntervalSamples < kTachPeriodSampleCount) {
+    ++tachPulseIntervalSamples;
+  }
   ++tachPulseCount;
 }
 
@@ -335,6 +367,15 @@ float adcVoltsToBatteryVolts(float volts) {
   return max(0.0F, volts * kBatteryDividerMultiplier);
 }
 
+float adcVoltsToAfr(float volts) {
+  const float signalVolts = max(0.0F, volts * kAfrDividerMultiplier);
+  constexpr float kAfrSpan = kAfrAtFiveVolts - kAfrAtZeroVolts;
+
+  return constrain(kAfrAtZeroVolts + signalVolts * kAfrSpan / 5.0F,
+                   kAfrAtZeroVolts,
+                   kAfrAtFiveVolts);
+}
+
 void invalidateThrottleAdc() {
   throttleAdcValid = false;
   throttleFilterInitialized = false;
@@ -347,6 +388,14 @@ void invalidateBrakePressureAdc() {
   brakePressureAdcRaw = 0;
   brakePressureAdcVolts = 0.0F;
   brakePressureBar = 0.0F;
+}
+
+void invalidateAfrAdc() {
+  afrAdcValid = false;
+  afrAdcRaw = 0;
+  afrAdcVolts = 0.0F;
+  afrSignalVolts = 0.0F;
+  afr = kAfrAtZeroVolts;
 }
 
 void invalidateBatteryAdc() {
@@ -362,19 +411,32 @@ void invalidateEngineRpm() {
   engineRpmValid = false;
   engineRpmFilterInitialized = false;
   engineRpm = 0.0F;
+  tachWindowRpmValid = false;
+  tachWindowRpm = 0.0F;
 }
 
 void resetTachPulseState() {
+  uint32_t pulseCount = 0;
+
   noInterrupts();
   tachLastPulseUs = 0;
   tachPulseIntervalUs = 0;
-  lastTachPulseCount = tachPulseCount;
+  tachPulseIntervalIndex = 0;
+  tachPulseIntervalSamples = 0;
+  pulseCount = tachPulseCount;
   interrupts();
+
+  lastTachPulseCount = pulseCount;
+  lastTachWindowPulseCount = pulseCount;
+  lastTachWindowUs = micros();
+  tachWindowRpmValid = false;
+  tachWindowRpm = 0.0F;
 }
 
 void invalidateAds1115Measurements() {
   invalidateThrottleAdc();
   invalidateBrakePressureAdc();
+  invalidateAfrAdc();
 }
 
 float updateThrottleFilteredVolts(float volts, bool resetFilter) {
@@ -400,6 +462,46 @@ float updateBatteryFilteredVolts(float volts) {
   return batteryVolts;
 }
 
+float tachIntervalUsToRpm(uint32_t intervalUs) {
+  if (intervalUs == 0) {
+    return 0.0F;
+  }
+
+  const float pulseHz = 1000000.0F / static_cast<float>(intervalUs);
+  return pulseHz * 60.0F / kIgnitionPulsesPerRevolution;
+}
+
+float tachPulseWindowToRpm(uint32_t pulseCount, uint32_t elapsedUs) {
+  if (pulseCount == 0 || elapsedUs == 0) {
+    return 0.0F;
+  }
+
+  const float pulseHz =
+      static_cast<float>(pulseCount) * 1000000.0F / static_cast<float>(elapsedUs);
+  return pulseHz * 60.0F / kIgnitionPulsesPerRevolution;
+}
+
+uint32_t medianTachIntervalUs(uint32_t *intervals, uint8_t count) {
+  for (uint8_t i = 1; i < count; ++i) {
+    const uint32_t value = intervals[i];
+    uint8_t j = i;
+    while (j > 0 && intervals[j - 1] > value) {
+      intervals[j] = intervals[j - 1];
+      --j;
+    }
+    intervals[j] = value;
+  }
+
+  if (count == 0) {
+    return 0;
+  }
+  if ((count % 2) == 1) {
+    return intervals[count / 2];
+  }
+
+  return (intervals[count / 2 - 1] + intervals[count / 2]) / 2;
+}
+
 float updateEngineRpmFiltered(float rpm) {
   if (!engineRpmFilterInitialized) {
     engineRpm = rpm;
@@ -407,8 +509,26 @@ float updateEngineRpmFiltered(float rpm) {
     return engineRpm;
   }
 
-  engineRpm += kEngineRpmFilterAlpha * (rpm - engineRpm);
+  const float alpha =
+      rpm < engineRpm ? kEngineRpmFallFilterAlpha : kEngineRpmRiseFilterAlpha;
+  engineRpm += alpha * (rpm - engineRpm);
   return engineRpm;
+}
+
+void limitEngineRpmByPulseAge(uint32_t nowUs, uint32_t lastPulseUs) {
+  if (!engineRpmValid || lastPulseUs == 0) {
+    return;
+  }
+
+  const uint32_t pulseAgeUs = nowUs - lastPulseUs;
+  if (pulseAgeUs == 0) {
+    return;
+  }
+
+  const float maxPossibleRpm = tachIntervalUsToRpm(pulseAgeUs);
+  if (engineRpm > maxPossibleRpm) {
+    engineRpm = maxPossibleRpm;
+  }
 }
 
 float updateBrakePressureFilteredBar(float pressureBar) {
@@ -446,6 +566,14 @@ void updateBrakePressureAdcState(int16_t rawValue, float volts) {
   brakePressureAdcValid = true;
 }
 
+void updateAfrAdcState(int16_t rawValue, float volts) {
+  afrAdcRaw = rawValue;
+  afrAdcVolts = volts;
+  afrSignalVolts = max(0.0F, volts * kAfrDividerMultiplier);
+  afr = adcVoltsToAfr(volts);
+  afrAdcValid = true;
+}
+
 void updateBatteryAdcState(int16_t rawValue, float volts) {
   batteryAdcRaw = rawValue;
   batteryAdcVolts = volts;
@@ -458,11 +586,17 @@ void updateEngineRpm(uint32_t) {
   uint32_t pulseIntervalUs = 0;
   uint32_t pulseCount = 0;
   uint32_t lastPulseUs = 0;
+  uint32_t pulseIntervalsUs[kTachPeriodSampleCount] = {};
+  uint8_t pulseIntervalSamples = 0;
 
   noInterrupts();
   pulseIntervalUs = tachPulseIntervalUs;
   pulseCount = tachPulseCount;
   lastPulseUs = tachLastPulseUs;
+  pulseIntervalSamples = tachPulseIntervalSamples;
+  for (uint8_t i = 0; i < pulseIntervalSamples; ++i) {
+    pulseIntervalsUs[i] = tachPulseIntervalsUs[i];
+  }
   interrupts();
 
   const uint32_t nowUs = micros();
@@ -476,13 +610,44 @@ void updateEngineRpm(uint32_t) {
     return;
   }
 
+  limitEngineRpmByPulseAge(nowUs, lastPulseUs);
+
+  if (lastTachWindowUs == 0) {
+    lastTachWindowUs = nowUs;
+    lastTachWindowPulseCount = pulseCount;
+  }
+
+  const uint32_t windowElapsedUs = nowUs - lastTachWindowUs;
+  if (windowElapsedUs >= static_cast<uint32_t>(kTachCountWindowMs) * 1000UL) {
+    const uint32_t windowPulseCount = pulseCount - lastTachWindowPulseCount;
+    if (windowPulseCount >= kTachCountWindowMinPulses) {
+      tachWindowRpm = tachPulseWindowToRpm(windowPulseCount, windowElapsedUs);
+      tachWindowRpmValid = true;
+    } else {
+      tachWindowRpmValid = false;
+      tachWindowRpm = 0.0F;
+    }
+
+    lastTachWindowPulseCount = pulseCount;
+    lastTachWindowUs = nowUs;
+  }
+
   if (pulseCount == lastTachPulseCount || pulseIntervalUs == 0) {
     return;
   }
 
   lastTachPulseCount = pulseCount;
-  const float pulseHz = 1000000.0F / static_cast<float>(pulseIntervalUs);
-  const float rpm = pulseHz * 60.0F / kIgnitionPulsesPerRevolution;
+  uint32_t periodIntervalUs = pulseIntervalUs;
+  if (pulseIntervalSamples > 0) {
+    periodIntervalUs =
+        medianTachIntervalUs(pulseIntervalsUs, pulseIntervalSamples);
+  }
+
+  float rpm = tachIntervalUsToRpm(periodIntervalUs);
+  if (tachWindowRpmValid && rpm >= kTachCountWindowMinRpm) {
+    rpm = rpm * (1.0F - kTachWindowBlend) + tachWindowRpm * kTachWindowBlend;
+  }
+
   updateEngineRpmFiltered(rpm);
   engineRpmValid = true;
 }
@@ -529,6 +694,27 @@ void updateBrakePressureFromAdc(uint32_t now) {
   }
 
   updateBrakePressureAdcState(rawValue, volts);
+}
+
+void updateAfrFromAdc(uint32_t now) {
+  if (adcI2cAddress == 0 || now - lastAfrAdcReadMs < kAfrAdcReadIntervalMs) {
+    return;
+  }
+
+  lastAfrAdcReadMs = now;
+
+  int16_t rawValue = 0;
+  float volts = 0.0F;
+  if (!readAds1115SingleEnded(kAfrAdcChannel, rawValue, volts)) {
+    Serial.printf("ADS1115 AFR A%u read failed at 0x%02X, will retry scan\n",
+                  kAfrAdcChannel,
+                  adcI2cAddress);
+    adcI2cAddress = 0;
+    invalidateAds1115Measurements();
+    return;
+  }
+
+  updateAfrAdcState(rawValue, volts);
 }
 
 void updateBatteryFromAdc(uint32_t now) {
@@ -984,9 +1170,10 @@ void printAdcReadings(uint32_t now) {
                          false);
   updateBrakePressureAdcState(rawValues[kBrakePressureAdcChannel],
                               volts[kBrakePressureAdcChannel]);
+  updateAfrAdcState(rawValues[kAfrAdcChannel], volts[kAfrAdcChannel]);
 
   Serial.printf(
-      "ADC ADS1115 A0=%d %.3fV filtered=%.3fV throttle=%.1f%%, A1=%d %.3fV brake=%.1f bar, A2=%d %.3fV unused, A3=%d %.3fV; ESP32 GPIO%u=%s %.3fV raw=%d battery=%.3fV filtered=%.3fV\n",
+      "ADC ADS1115 A0=%d %.3fV filtered=%.3fV throttle=%.1f%%, A1=%d %.3fV brake=%.1f bar, A2=%d %.3fV signal=%.3fV AFR=%.2f, A3=%d %.3fV unused; ESP32 GPIO%u=%s %.3fV raw=%d battery=%.3fV filtered=%.3fV\n",
       rawValues[0],
       volts[0],
       throttleFilteredVolts,
@@ -996,6 +1183,8 @@ void printAdcReadings(uint32_t now) {
       brakePressureBar,
       rawValues[2],
       volts[2],
+      afrSignalVolts,
+      afr,
       rawValues[3],
       volts[3],
       kBatteryAdcPin,
@@ -1021,12 +1210,18 @@ uint16_t rpmToUint16(float rpm) {
   return static_cast<uint16_t>(lroundf(rpm));
 }
 
+uint16_t afrToCentiAfr(float afr) {
+  afr = constrain(afr, kAfrAtZeroVolts, kAfrAtFiveVolts);
+  return static_cast<uint16_t>(lroundf(afr * 100.0F));
+}
+
 bool shouldSendPid(uint32_t pid) {
   return allowAllPids ||
          (pid == kBrakePressurePid && brakePressurePidAllowed) ||
          (pid == kThrottlePositionPid && throttlePositionPidAllowed) ||
          (pid == kBatteryVoltagePid && batteryVoltagePidAllowed) ||
-         (pid == kEngineRpmPid && engineRpmPidAllowed);
+         (pid == kEngineRpmPid && engineRpmPidAllowed) ||
+         (pid == kAfrPid && afrPidAllowed);
 }
 
 bool publishCanValue(uint32_t pid, uint16_t rawValue) {
@@ -1047,23 +1242,26 @@ bool publishCanValue(uint32_t pid, uint16_t rawValue) {
 void publishTelemetry(float pressureBar,
                       float throttlePercent,
                       float batteryVolts,
-                      float rpm) {
+                      float rpm,
+                      float afr) {
   const uint16_t pressureCentibar = pressureBarToCentibar(pressureBar);
   const uint16_t throttleCentipercent =
       static_cast<uint16_t>(lroundf(constrain(throttlePercent, 0.0F, 100.0F) * 100.0F));
   const uint16_t batteryMillivolts = voltsToMillivolts(batteryVolts);
   const uint16_t engineRpmRaw = rpmToUint16(rpm);
+  const uint16_t afrCentivalue = afrToCentiAfr(afr);
 
   const bool brakeSent = publishCanValue(kBrakePressurePid, pressureCentibar);
   const bool throttleSent = publishCanValue(kThrottlePositionPid, throttleCentipercent);
   const bool batterySent = publishCanValue(kBatteryVoltagePid, batteryMillivolts);
   const bool rpmSent = publishCanValue(kEngineRpmPid, engineRpmRaw);
+  const bool afrSent = publishCanValue(kAfrPid, afrCentivalue);
 
   const uint32_t now = millis();
   if (now - lastBleTxLogMs >= kBleTxLogIntervalMs) {
     lastBleTxLogMs = now;
     Serial.printf(
-        "BLE TX brake=%s PID=0x%08lX pressure=%.2f bar (%u), throttle=%s PID=0x%08lX throttle=%.2f %% (%u), battery=%s PID=0x%08lX voltage=%.3f V (%u mV), rpm=%s PID=0x%08lX engine=%.0f rpm (%u)\n",
+        "BLE TX brake=%s PID=0x%08lX pressure=%.2f bar (%u), throttle=%s PID=0x%08lX throttle=%.2f %% (%u), battery=%s PID=0x%08lX voltage=%.3f V (%u mV), rpm=%s PID=0x%08lX engine=%.0f rpm (%u), afr=%s PID=0x%08lX value=%.2f (%u)\n",
         brakeSent ? "sent" : "filtered",
         static_cast<unsigned long>(kBrakePressurePid),
         pressureBar,
@@ -1079,7 +1277,11 @@ void publishTelemetry(float pressureBar,
         rpmSent ? "sent" : "filtered",
         static_cast<unsigned long>(kEngineRpmPid),
         rpm,
-        engineRpmRaw);
+        engineRpmRaw,
+        afrSent ? "sent" : "filtered",
+        static_cast<unsigned long>(kAfrPid),
+        afr,
+        afrCentivalue);
   }
 }
 
@@ -1110,6 +1312,7 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       throttlePositionPidAllowed = false;
       batteryVoltagePidAllowed = false;
       engineRpmPidAllowed = false;
+      afrPidAllowed = false;
       Serial.println("RaceChrono filter: deny all PIDs");
       return;
     }
@@ -1120,6 +1323,7 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       throttlePositionPidAllowed = true;
       batteryVoltagePidAllowed = true;
       engineRpmPidAllowed = true;
+      afrPidAllowed = true;
       notifyIntervalMs = max<uint16_t>(1, readUint16Be(data + 1));
       Serial.printf("RaceChrono filter: allow all PIDs, interval=%u ms\n", notifyIntervalMs);
       return;
@@ -1131,7 +1335,8 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       const bool knownPid = pid == kBrakePressurePid ||
                             pid == kThrottlePositionPid ||
                             pid == kBatteryVoltagePid ||
-                            pid == kEngineRpmPid;
+                            pid == kEngineRpmPid ||
+                            pid == kAfrPid;
       if (pid == kBrakePressurePid) {
         brakePressurePidAllowed = true;
       } else if (pid == kThrottlePositionPid) {
@@ -1140,6 +1345,8 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
         batteryVoltagePidAllowed = true;
       } else if (pid == kEngineRpmPid) {
         engineRpmPidAllowed = true;
+      } else if (pid == kAfrPid) {
+        afrPidAllowed = true;
       }
       if (knownPid) {
         notifyIntervalMs = interval;
@@ -1203,6 +1410,8 @@ void setup() {
                 static_cast<unsigned long>(kBatteryVoltagePid));
   Serial.printf("RaceChrono BLE CAN PID 0x%08lX: engine RPM, rpm\n",
                 static_cast<unsigned long>(kEngineRpmPid));
+  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: AFR, centi-AFR\n",
+                static_cast<unsigned long>(kAfrPid));
 
   loadThrottleCalibration();
   startBatteryAdc();
@@ -1218,13 +1427,14 @@ void loop() {
 
   updateThrottleFromAdc(now);
   updateBrakePressureFromAdc(now);
+  updateAfrFromAdc(now);
   updateBatteryFromAdc(now);
   updateEngineRpm(now);
   updateLedIdleBlink(now);
 
   if (bleClientConnected && now - lastCanNotifyMs >= notifyIntervalMs) {
     lastCanNotifyMs = now;
-    publishTelemetry(brakePressureBar, throttlePercent, batteryVolts, engineRpm);
+    publishTelemetry(brakePressureBar, throttlePercent, batteryVolts, engineRpm, afr);
   }
 
   printAdcReadings(now);
@@ -1245,7 +1455,7 @@ void loop() {
     lastStatusLogMs = now;
 
     Serial.printf(
-        "uptime=%lu ms, free_heap=%u bytes, cpu=%u MHz, ble=%s, brake=%.1f bar (A1=%s %.3fV raw=%d), throttle=%.1f %% (A0=%s %.3fV raw=%d), battery=%.3f V filtered (GPIO%u=%s %.3fV instant=%.3f V raw=%d), rpm=%s %.0f (GPIO%u pulses/rev=%.2f)\n",
+        "uptime=%lu ms, free_heap=%u bytes, cpu=%u MHz, ble=%s, brake=%.1f bar (A1=%s %.3fV raw=%d), throttle=%.1f %% (A0=%s %.3fV raw=%d), battery=%.3f V filtered (GPIO%u=%s %.3fV instant=%.3f V raw=%d), rpm=%s %.0f (GPIO%u pulses/rev=%.2f), afr=%s %.2f (A2=%.3fV signal=%.3fV raw=%d)\n",
         static_cast<unsigned long>(now),
         ESP.getFreeHeap(),
         ESP.getCpuFreqMHz(),
@@ -1267,6 +1477,11 @@ void loop() {
         engineRpmValid ? "ok" : "missing",
         engineRpm,
         kTachInputPin,
-        kIgnitionPulsesPerRevolution);
+        kIgnitionPulsesPerRevolution,
+        afrAdcValid ? "ok" : "missing",
+        afr,
+        afrAdcVolts,
+        afrSignalVolts,
+        afrAdcRaw);
   }
 }
