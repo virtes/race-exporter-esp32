@@ -16,6 +16,7 @@ constexpr char kCanFilterCharacteristicUuid[] = "00000002-0000-1000-8000-00805f9
 constexpr uint32_t kBrakePressurePid = 0x00000101;
 constexpr uint32_t kThrottlePositionPid = 0x00000102;
 constexpr uint32_t kBatteryVoltagePid = 0x00000103;
+constexpr uint32_t kEngineRpmPid = 0x00000104;
 constexpr uint16_t kDefaultNotifyIntervalMs = 20;
 constexpr uint16_t kBleTxLogIntervalMs = 5000;
 constexpr uint16_t kMaxBrakePressureBar = 250;
@@ -53,6 +54,11 @@ constexpr uint8_t kBatteryAdcPin = 34;
 constexpr uint8_t kBatteryAdcResolutionBits = 12;
 constexpr uint16_t kBatteryAdcReadIntervalMs = 1000;
 constexpr uint8_t kBatteryAdcSampleCount = 8;
+constexpr uint8_t kTachInputPin = 27;
+constexpr float kIgnitionPulsesPerRevolution = 1.0F;
+constexpr uint16_t kTachMinPulseIntervalUs = 1000;
+constexpr uint16_t kTachSignalTimeoutMs = 1000;
+constexpr float kEngineRpmFilterAlpha = 0.35F;
 constexpr uint16_t kThrottleZeroCalibrationMs = 1000;
 constexpr uint16_t kThrottleOpenCalibrationPauseMs = 2000;
 constexpr uint16_t kThrottleOpenCalibrationMs = 2000;
@@ -88,6 +94,7 @@ bool allowAllPids = true;
 bool brakePressurePidAllowed = true;
 bool throttlePositionPidAllowed = true;
 bool batteryVoltagePidAllowed = true;
+bool engineRpmPidAllowed = true;
 uint16_t notifyIntervalMs = kDefaultNotifyIntervalMs;
 uint32_t lastCanNotifyMs = 0;
 uint32_t lastBleTxLogMs = 0;
@@ -120,10 +127,36 @@ float batteryMeasuredVolts = 0.0F;
 float batteryVolts = 0.0F;
 bool batteryAdcValid = false;
 bool batteryFilterInitialized = false;
+volatile uint32_t tachLastPulseUs = 0;
+volatile uint32_t tachPulseIntervalUs = 0;
+volatile uint32_t tachPulseCount = 0;
+float engineRpm = 0.0F;
+bool engineRpmValid = false;
+bool engineRpmFilterInitialized = false;
+uint32_t lastTachPulseCount = 0;
 bool ledOn = false;
 bool ledIdleBlinkOn = false;
 bool ledIdleConnected = false;
 bool ledSensorActive = false;
+
+void IRAM_ATTR handleTachPulse() {
+  const uint32_t nowUs = micros();
+  const uint32_t previousPulseUs = tachLastPulseUs;
+
+  if (previousPulseUs == 0) {
+    tachLastPulseUs = nowUs;
+    return;
+  }
+
+  const uint32_t intervalUs = nowUs - previousPulseUs;
+  if (intervalUs < kTachMinPulseIntervalUs) {
+    return;
+  }
+
+  tachLastPulseUs = nowUs;
+  tachPulseIntervalUs = intervalUs;
+  ++tachPulseCount;
+}
 
 uint16_t readUint16Be(const uint8_t *data) {
   return (static_cast<uint16_t>(data[0]) << 8) | data[1];
@@ -325,6 +358,20 @@ void invalidateBatteryAdc() {
   batteryVolts = 0.0F;
 }
 
+void invalidateEngineRpm() {
+  engineRpmValid = false;
+  engineRpmFilterInitialized = false;
+  engineRpm = 0.0F;
+}
+
+void resetTachPulseState() {
+  noInterrupts();
+  tachLastPulseUs = 0;
+  tachPulseIntervalUs = 0;
+  lastTachPulseCount = tachPulseCount;
+  interrupts();
+}
+
 void invalidateAds1115Measurements() {
   invalidateThrottleAdc();
   invalidateBrakePressureAdc();
@@ -351,6 +398,17 @@ float updateBatteryFilteredVolts(float volts) {
 
   batteryVolts += kBatteryAdcFilterAlpha * (volts - batteryVolts);
   return batteryVolts;
+}
+
+float updateEngineRpmFiltered(float rpm) {
+  if (!engineRpmFilterInitialized) {
+    engineRpm = rpm;
+    engineRpmFilterInitialized = true;
+    return engineRpm;
+  }
+
+  engineRpm += kEngineRpmFilterAlpha * (rpm - engineRpm);
+  return engineRpm;
 }
 
 float updateBrakePressureFilteredBar(float pressureBar) {
@@ -394,6 +452,39 @@ void updateBatteryAdcState(int16_t rawValue, float volts) {
   batteryMeasuredVolts = adcVoltsToBatteryVolts(volts);
   updateBatteryFilteredVolts(batteryMeasuredVolts);
   batteryAdcValid = true;
+}
+
+void updateEngineRpm(uint32_t) {
+  uint32_t pulseIntervalUs = 0;
+  uint32_t pulseCount = 0;
+  uint32_t lastPulseUs = 0;
+
+  noInterrupts();
+  pulseIntervalUs = tachPulseIntervalUs;
+  pulseCount = tachPulseCount;
+  lastPulseUs = tachLastPulseUs;
+  interrupts();
+
+  const uint32_t nowUs = micros();
+  if (lastPulseUs == 0 ||
+      nowUs - lastPulseUs >
+          static_cast<uint32_t>(kTachSignalTimeoutMs) * 1000UL) {
+    if (lastPulseUs != 0 || pulseIntervalUs != 0) {
+      resetTachPulseState();
+    }
+    invalidateEngineRpm();
+    return;
+  }
+
+  if (pulseCount == lastTachPulseCount || pulseIntervalUs == 0) {
+    return;
+  }
+
+  lastTachPulseCount = pulseCount;
+  const float pulseHz = 1000000.0F / static_cast<float>(pulseIntervalUs);
+  const float rpm = pulseHz * 60.0F / kIgnitionPulsesPerRevolution;
+  updateEngineRpmFiltered(rpm);
+  engineRpmValid = true;
 }
 
 void updateThrottleFromAdc(uint32_t now) {
@@ -843,6 +934,17 @@ void startBatteryAdc() {
       kBatteryAdcResolutionBits);
 }
 
+void startTachInput() {
+  pinMode(kTachInputPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(kTachInputPin), handleTachPulse, FALLING);
+
+  Serial.printf(
+      "Engine RPM input on ESP32 GPIO%u, falling edge, pulses/rev=%.2f, timeout=%u ms\n",
+      kTachInputPin,
+      kIgnitionPulsesPerRevolution,
+      kTachSignalTimeoutMs);
+}
+
 void printAdcReadings(uint32_t now) {
   if (adcI2cAddress == 0) {
     if (now - lastAdcMissingLogMs >= kAdcMissingLogIntervalMs) {
@@ -914,11 +1016,17 @@ uint16_t voltsToMillivolts(float volts) {
   return static_cast<uint16_t>(lroundf(volts * 1000.0F));
 }
 
+uint16_t rpmToUint16(float rpm) {
+  rpm = constrain(rpm, 0.0F, 65535.0F);
+  return static_cast<uint16_t>(lroundf(rpm));
+}
+
 bool shouldSendPid(uint32_t pid) {
   return allowAllPids ||
          (pid == kBrakePressurePid && brakePressurePidAllowed) ||
          (pid == kThrottlePositionPid && throttlePositionPidAllowed) ||
-         (pid == kBatteryVoltagePid && batteryVoltagePidAllowed);
+         (pid == kBatteryVoltagePid && batteryVoltagePidAllowed) ||
+         (pid == kEngineRpmPid && engineRpmPidAllowed);
 }
 
 bool publishCanValue(uint32_t pid, uint16_t rawValue) {
@@ -938,21 +1046,24 @@ bool publishCanValue(uint32_t pid, uint16_t rawValue) {
 
 void publishTelemetry(float pressureBar,
                       float throttlePercent,
-                      float batteryVolts) {
+                      float batteryVolts,
+                      float rpm) {
   const uint16_t pressureCentibar = pressureBarToCentibar(pressureBar);
   const uint16_t throttleCentipercent =
       static_cast<uint16_t>(lroundf(constrain(throttlePercent, 0.0F, 100.0F) * 100.0F));
   const uint16_t batteryMillivolts = voltsToMillivolts(batteryVolts);
+  const uint16_t engineRpmRaw = rpmToUint16(rpm);
 
   const bool brakeSent = publishCanValue(kBrakePressurePid, pressureCentibar);
   const bool throttleSent = publishCanValue(kThrottlePositionPid, throttleCentipercent);
   const bool batterySent = publishCanValue(kBatteryVoltagePid, batteryMillivolts);
+  const bool rpmSent = publishCanValue(kEngineRpmPid, engineRpmRaw);
 
   const uint32_t now = millis();
   if (now - lastBleTxLogMs >= kBleTxLogIntervalMs) {
     lastBleTxLogMs = now;
     Serial.printf(
-        "BLE TX brake=%s PID=0x%08lX pressure=%.2f bar (%u), throttle=%s PID=0x%08lX throttle=%.2f %% (%u), battery=%s PID=0x%08lX voltage=%.3f V (%u mV)\n",
+        "BLE TX brake=%s PID=0x%08lX pressure=%.2f bar (%u), throttle=%s PID=0x%08lX throttle=%.2f %% (%u), battery=%s PID=0x%08lX voltage=%.3f V (%u mV), rpm=%s PID=0x%08lX engine=%.0f rpm (%u)\n",
         brakeSent ? "sent" : "filtered",
         static_cast<unsigned long>(kBrakePressurePid),
         pressureBar,
@@ -964,7 +1075,11 @@ void publishTelemetry(float pressureBar,
         batterySent ? "sent" : "filtered",
         static_cast<unsigned long>(kBatteryVoltagePid),
         batteryVolts,
-        batteryMillivolts);
+        batteryMillivolts,
+        rpmSent ? "sent" : "filtered",
+        static_cast<unsigned long>(kEngineRpmPid),
+        rpm,
+        engineRpmRaw);
   }
 }
 
@@ -994,6 +1109,7 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       brakePressurePidAllowed = false;
       throttlePositionPidAllowed = false;
       batteryVoltagePidAllowed = false;
+      engineRpmPidAllowed = false;
       Serial.println("RaceChrono filter: deny all PIDs");
       return;
     }
@@ -1003,6 +1119,7 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       brakePressurePidAllowed = true;
       throttlePositionPidAllowed = true;
       batteryVoltagePidAllowed = true;
+      engineRpmPidAllowed = true;
       notifyIntervalMs = max<uint16_t>(1, readUint16Be(data + 1));
       Serial.printf("RaceChrono filter: allow all PIDs, interval=%u ms\n", notifyIntervalMs);
       return;
@@ -1013,13 +1130,16 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       const uint32_t pid = readUint32Be(data + 3);
       const bool knownPid = pid == kBrakePressurePid ||
                             pid == kThrottlePositionPid ||
-                            pid == kBatteryVoltagePid;
+                            pid == kBatteryVoltagePid ||
+                            pid == kEngineRpmPid;
       if (pid == kBrakePressurePid) {
         brakePressurePidAllowed = true;
       } else if (pid == kThrottlePositionPid) {
         throttlePositionPidAllowed = true;
       } else if (pid == kBatteryVoltagePid) {
         batteryVoltagePidAllowed = true;
+      } else if (pid == kEngineRpmPid) {
+        engineRpmPidAllowed = true;
       }
       if (knownPid) {
         notifyIntervalMs = interval;
@@ -1081,9 +1201,12 @@ void setup() {
                 static_cast<unsigned long>(kThrottlePositionPid));
   Serial.printf("RaceChrono BLE CAN PID 0x%08lX: battery voltage, millivolts\n",
                 static_cast<unsigned long>(kBatteryVoltagePid));
+  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: engine RPM, rpm\n",
+                static_cast<unsigned long>(kEngineRpmPid));
 
   loadThrottleCalibration();
   startBatteryAdc();
+  startTachInput();
   startAdc();
   calibrateThrottle();
   startRaceChronoBle();
@@ -1096,11 +1219,12 @@ void loop() {
   updateThrottleFromAdc(now);
   updateBrakePressureFromAdc(now);
   updateBatteryFromAdc(now);
+  updateEngineRpm(now);
   updateLedIdleBlink(now);
 
   if (bleClientConnected && now - lastCanNotifyMs >= notifyIntervalMs) {
     lastCanNotifyMs = now;
-    publishTelemetry(brakePressureBar, throttlePercent, batteryVolts);
+    publishTelemetry(brakePressureBar, throttlePercent, batteryVolts, engineRpm);
   }
 
   printAdcReadings(now);
@@ -1121,7 +1245,7 @@ void loop() {
     lastStatusLogMs = now;
 
     Serial.printf(
-        "uptime=%lu ms, free_heap=%u bytes, cpu=%u MHz, ble=%s, brake=%.1f bar (A1=%s %.3fV raw=%d), throttle=%.1f %% (A0=%s %.3fV raw=%d), battery=%.3f V filtered (GPIO%u=%s %.3fV instant=%.3f V raw=%d)\n",
+        "uptime=%lu ms, free_heap=%u bytes, cpu=%u MHz, ble=%s, brake=%.1f bar (A1=%s %.3fV raw=%d), throttle=%.1f %% (A0=%s %.3fV raw=%d), battery=%.3f V filtered (GPIO%u=%s %.3fV instant=%.3f V raw=%d), rpm=%s %.0f (GPIO%u pulses/rev=%.2f)\n",
         static_cast<unsigned long>(now),
         ESP.getFreeHeap(),
         ESP.getCpuFreqMHz(),
@@ -1139,6 +1263,10 @@ void loop() {
         batteryAdcValid ? "ok" : "missing",
         batteryAdcVolts,
         batteryMeasuredVolts,
-        batteryAdcRaw);
+        batteryAdcRaw,
+        engineRpmValid ? "ok" : "missing",
+        engineRpm,
+        kTachInputPin,
+        kIgnitionPulsesPerRevolution);
   }
 }
