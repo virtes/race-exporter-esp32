@@ -99,7 +99,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `afr_voltage_divider` | Делитель AFR | `20 кОм` сверху и `20 кОм` снизу; делит аналоговый выход AFR пополам для входа `ADS1115 A2` |
 | `ignition_coil` | Катушка зажигания | Источник импульсов оборотов двигателя |
 | `tach_opto` | PC817 | Оптронная развязка входа оборотов от катушки зажигания |
-| `tach_input_resistors` | 2 x 4.7 кОм | Последовательные входные резисторы от `Катушка +12 В` к `PC817 pin 1` |
+| `tach_input_resistors` | 47 кОм | Входной резистор от `Катушка +12 В` к `PC817 pin 1` |
 | `tach_input_diode` | 1N4148 или 1N4007 | Защитный диод параллельно входному LED `PC817`, катод к `pin 1`, анод к `pin 2` |
 | `tach_pullup_resistor` | Резистор 10 кОм | Подтяжка тахо-входа `ESP32 GPIO27` к `3V3` |
 | `boost_converter` | Повышатель напряжения | Питает датчик давления от 1S LiPo АКБ |
@@ -126,7 +126,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `afr-signal` | `Средняя точка Rверх/Rниз` | `ADS1115 A2` | `afr_adc` | `Rверх = 20 кОм`, `Rниз = 20 кОм`; 4.764 В на выходе AFR дает около 2.382 В на `A2` |
 | `afr-signal-divider-gnd` | `Rниз 20 кОм` | `GND` | `gnd` | Нижнее плечо делителя AFR на общую землю |
 | `afr-gnd` | `AFR GND / signal GND` | `GND` | `gnd` | Земля AFR-контроллера должна быть общей с ESP32/ADS1115 |
-| `tach-coil-plus` | `Катушка +12 В` | `4.7 кОм -> 4.7 кОм -> PC817 pin 1` | `tach_coil_input` | Входной ток LED оптрона ограничен суммарно примерно 9.4 кОм |
+| `tach-coil-plus` | `Катушка +12 В` | `47 кОм -> PC817 pin 1` | `tach_coil_input` | Входной ток LED оптрона ограничен резистором 47 кОм |
 | `tach-coil-minus` | `Катушка -` | `PC817 pin 2` | `tach_coil_input` | Коммутируемый минус катушки; не соединять с `ESP32 GND` |
 | `tach-input-diode` | `1N4148/1N4007 катод` | `PC817 pin 1` | `tach_coil_input` | Диод стоит параллельно входному LED оптрона, полоской к `pin 1` |
 | `tach-input-diode-return` | `1N4148/1N4007 анод` | `PC817 pin 2` | `tach_coil_input` | Защищает входной LED `PC817` от обратного напряжения |
@@ -154,7 +154,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `afr_adc` | `AFR analog out 0-5 В -> 20 кОм -> ADS1115 A2`, `ADS1115 A2 -> 20 кОм -> GND` |
 | `i2c` | `ESP32 GPIO19 -> ADS1115 SCL`, `ESP32 GPIO22 -> ADS1115 SDA` |
 | `engine_rpm_input` | `ESP32 GPIO27`, `10 кОм pull-up к 3V3`, `PC817 pin 4`; `PC817 pin 3 -> ESP32 GND` |
-| `tach_coil_input` | `Катушка +12 В -> 4.7 кОм -> 4.7 кОм -> PC817 pin 1`, `Катушка - -> PC817 pin 2`, защитный диод между `PC817 pin 1` и `pin 2` |
+| `tach_coil_input` | `Катушка +12 В -> 47 кОм -> PC817 pin 1`, `Катушка - -> PC817 pin 2`, защитный диод между `PC817 pin 1` и `pin 2` |
 
 ### Важно
 
@@ -173,9 +173,8 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
   Без общей земли `ADS1115 A2` не имеет правильной точки отсчета для сигнала.
 - Минус катушки зажигания нельзя подключать напрямую к `ESP32`, `ADS1115` или
   общей земле схемы. Вход оборотов подключается только через `PC817`.
-- На входе `PC817` для оборотов используются два резистора `4.7 кОм`
-  последовательно от `Катушка +12 В` к `PC817 pin 1`; `PC817 pin 2`
-  подключается к `Катушка -`.
+- На входе `PC817` для оборотов используется резистор `47 кОм` от
+  `Катушка +12 В` к `PC817 pin 1`; `PC817 pin 2` подключается к `Катушка -`.
 - Защитный диод `1N4148` или `1N4007` ставится параллельно входному LED
   `PC817`: катод, сторона с полоской, к `PC817 pin 1`, анод к `PC817 pin 2`.
 - Выход `PC817` для оборотов: `PC817 pin 4 -> ESP32 GPIO27`, `PC817 pin 3 ->
