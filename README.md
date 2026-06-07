@@ -1,18 +1,20 @@
 # racechrono-collector-esp32
 
 ESP32-прошивка под PlatformIO для отправки телеметрии в RaceChrono через BLE
-DIY CAN-Bus API.
+DIY API: датчики идут через CAN-Bus feature, GPS идет через GPS feature.
 
 Сейчас проект читает положение дросселя через `SS49E -> ADS1115 A0 -> ESP32`,
 давление тормоза через датчик Bosch `0265005303 -> ADS1115 A1 -> ESP32`,
 AFR через аналоговый выход контроллера `0-5 В -> делитель 20 кОм/20 кОм ->
 ADS1115 A2 -> ESP32`, напряжение АКБ через делитель напряжения на
 `ESP32 GPIO34`, а обороты двигателя с первички CDI-катушки через резистор
-`47 кОм` и оптрон `PC817 -> ESP32 GPIO27`.
+`47 кОм` и оптрон `PC817 -> ESP32 GPIO27`, GPS-данные с модуля
+`GY-NEO6MV2 -> UART2 ESP32 GPIO16/GPIO17`.
 Дроссель публикуется как CAN PID `258`, давление тормоза публикуется как
 CAN PID `257`, напряжение АКБ публикуется как CAN PID `259`, обороты двигателя
-публикуются как CAN PID `260`, AFR публикуется как CAN PID `261`. Зеленый LED
-на `GPIO5` показывает калибровку и состояние BLE-подключения. OLED-дисплей
+публикуются как CAN PID `260`, AFR публикуется как CAN PID `261`. GPS
+публикуется через native RaceChrono BLE GPS-характеристики `0x0003/0x0004`.
+Зеленый LED на `GPIO5` показывает калибровку и состояние BLE-подключения. OLED-дисплей
 `SSD1306 128x64` на общей I2C-шине показывает `TH` (`ADS1115 A0`), `BR`
 (`ADS1115 A1`), `AF` (`ADS1115 A2`) и `BAT` четырьмя строками.
 
@@ -57,6 +59,13 @@ RaceChrono setup:
 Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth LE
 ```
 
+В настройках DIY BLE устройства включить два источника данных:
+
+```text
+GPS
+CAN-Bus
+```
+
 Каналы в Vehicle profile:
 
 | Канал | CAN PID | Equation | Unit |
@@ -66,6 +75,10 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | Battery voltage | `259` | `bytesToUint(raw, 0, 2) / 1000.0` | `V` |
 | Engine RPM | `260` | `bytesToUint(raw, 0, 2)` | `rpm` |
 | AFR | `261` | `bytesToUint(raw, 0, 2) / 100.0` | `AFR` |
+
+GPS-координаты, скорость, курс, высота, число спутников и HDOP приходят не как
+CAN PID, а как GPS-данные RaceChrono DIY BLE. Для них отдельные Vehicle profile
+каналы добавлять не нужно.
 
 ## LED-индикация
 
@@ -108,6 +121,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `boost_converter` | Повышатель напряжения | Питает датчик давления от 1S LiPo АКБ |
 | `battery` | 1S LiPo АКБ 3.7 В | Источник питания повышателя напряжения, до 4.2 В при полной зарядке |
 | `battery_voltage_divider` | Делитель напряжения АКБ | `100 кОм` сверху и `100 кОм` снизу; делит напряжение 1S LiPo примерно пополам для входа `ESP32 GPIO34` |
+| `gps_receiver` | GY-NEO6MV2 | GPS-модуль NEO-6M, NMEA 0183 по UART, целевая скорость 115200 бод |
 | `status_led` | Зеленый LED | Индикатор калибровки и BLE |
 | `status_led_resistor` | Резистор 470 Ом | Ограничивает ток светодиода |
 
@@ -148,6 +162,10 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `display-gnd` | `SSD1306 GND` | `GND` | `gnd` | Общая земля дисплея с ESP32/ADS1115 |
 | `display-scl` | `ESP32 GPIO19` | `SSD1306 SCL` | `i2c_scl` | Дисплей подключен параллельно `ADS1115 SCL` на общей I2C-шине |
 | `display-sda` | `ESP32 GPIO22` | `SSD1306 SDA` | `i2c_sda` | Дисплей подключен параллельно `ADS1115 SDA` на общей I2C-шине |
+| `gps-power` | `ESP32 3V3` | `GY-NEO6MV2 VCC` | `3v3` | GPS питается от 3.3 В |
+| `gps-gnd` | `GY-NEO6MV2 GND` | `GND` | `gnd` | Земля GPS общая с ESP32 |
+| `gps-uart-rx` | `GY-NEO6MV2 TX` | `ESP32 GPIO16` | `gps_uart_rx` | UART2 RX, в коде `kGpsRxPin = 16`, NMEA 0183 115200 бод после автонастройки |
+| `gps-uart-tx` | `ESP32 GPIO17` | `GY-NEO6MV2 RX` | `gps_uart_tx` | UART2 TX, в коде `kGpsTxPin = 17`; нужен для автоматической настройки GPS на NMEA 115200 бод |
 
 ### Логические шины
 
@@ -162,6 +180,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `i2c` | `ESP32 GPIO19 -> ADS1115 SCL и SSD1306 SCL`, `ESP32 GPIO22 -> ADS1115 SDA и SSD1306 SDA` |
 | `engine_rpm_input` | `ESP32 GPIO27`, `10 кОм pull-up к 3V3`, `PC817 pin 4`; `PC817 pin 3 -> ESP32 GND` |
 | `tach_coil_input` | `Импульсный вывод первички CDI-катушки -> 47 кОм -> PC817 pin 1`, `второй вывод первички CDI-катушки / возврат CDI -> PC817 pin 2`, защитный диод между `PC817 pin 1` и `pin 2` |
+| `gps_uart` | `GY-NEO6MV2 TX -> ESP32 GPIO16`, `ESP32 GPIO17 -> GY-NEO6MV2 RX`, NMEA 0183 115200 бод после автонастройки |
 
 ### Важно
 
@@ -169,6 +188,16 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
   тахо-входа (`первичка CDI-катушки`, вход `PC817 pin 1/2`) остается
   гальванически развязанной от `ESP32 GND`.
 - ADS1115, SSD1306 и SS49E питаются от `3V3`, не от `5V`.
+- GY-NEO6MV2 подключен к отдельному UART2: `GPS TX -> GPIO16`, `GPS RX ->
+  GPIO17`, целевая скорость `115200` бод. Прошивка отправляет u-blox
+  `UBX-CFG-PRT` на типовых скоростях `115200/9600/38400/57600/4800`, чтобы
+  перевести UART GPS в режим `115200 8N1`, вход `UBX+NMEA`, выход `NMEA`.
+  Поэтому линия
+  `GPIO17 -> GPS RX` должна быть подключена.
+- GPS питается от `ESP32 3V3`. Если конкретная плата GY-NEO6MV2 питается от
+  `5V`, нужно убедиться, что ее `TX` не подает 5 В на вход `GPIO16`.
+- В RaceChrono GPS передается через BLE DIY GPS feature, характеристики
+  `0x0003` и `0x0004` сервиса `0x1FF8`. CAN PID для координат не используются.
 - SSD1306 подключается к той же I2C-шине, что и ADS1115:
   `GPIO19 -> SCL`, `GPIO22 -> SDA`. В прошивке дисплей ищется по адресам
   `0x3C` и `0x3D`, а ADS1115 по адресам `0x48..0x4B`, поэтому штатный

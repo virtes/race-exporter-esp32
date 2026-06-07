@@ -6,6 +6,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <Preferences.h>
+#include <TinyGPSPlus.h>
 #include <Wire.h>
 
 namespace {
@@ -14,6 +15,8 @@ constexpr char kDeviceName[] = "RaceExporter";
 constexpr char kRaceChronoServiceUuid[] = "00001ff8-0000-1000-8000-00805f9b34fb";
 constexpr char kCanMainCharacteristicUuid[] = "00000001-0000-1000-8000-00805f9b34fb";
 constexpr char kCanFilterCharacteristicUuid[] = "00000002-0000-1000-8000-00805f9b34fb";
+constexpr char kGpsMainCharacteristicUuid[] = "00000003-0000-1000-8000-00805f9b34fb";
+constexpr char kGpsTimeCharacteristicUuid[] = "00000004-0000-1000-8000-00805f9b34fb";
 
 constexpr uint32_t kBrakePressurePid = 0x00000101;
 constexpr uint32_t kThrottlePositionPid = 0x00000102;
@@ -21,9 +24,8 @@ constexpr uint32_t kBatteryVoltagePid = 0x00000103;
 constexpr uint32_t kEngineRpmPid = 0x00000104;
 constexpr uint32_t kAfrPid = 0x00000105;
 constexpr uint16_t kDefaultNotifyIntervalMs = 20;
-constexpr uint16_t kBleTxLogIntervalMs = 5000;
+constexpr uint16_t kBleTxLogIntervalMs = 30000;
 constexpr uint16_t kMaxBrakePressureBar = 250;
-constexpr uint16_t kStatusLogIntervalMs = 10000;
 constexpr uint8_t kLedPin = 5;
 constexpr uint8_t kLedPwmChannel = 0;
 constexpr uint16_t kLedPwmFrequencyHz = 1000;
@@ -76,6 +78,18 @@ constexpr float kTachCountWindowMinRpm = 1800.0F;
 constexpr float kTachWindowBlend = 0.35F;
 constexpr float kEngineRpmRiseFilterAlpha = 0.35F;
 constexpr float kEngineRpmFallFilterAlpha = 0.75F;
+constexpr uint8_t kGpsRxPin = 16;
+constexpr uint8_t kGpsTxPin = 17;
+constexpr uint32_t kGpsBaudRates[] = {115200, 9600, 38400, 57600, 4800};
+constexpr uint8_t kGpsBaudRateCount =
+    sizeof(kGpsBaudRates) / sizeof(kGpsBaudRates[0]);
+constexpr uint32_t kGpsTargetBaudRate = 115200;
+constexpr uint32_t kGpsInitialBaudRate = kGpsTargetBaudRate;
+constexpr uint16_t kGpsFreshAgeMs = 2500;
+constexpr uint16_t kGpsDebugLogIntervalMs = 2000;
+constexpr uint16_t kGpsBaudProbeIntervalMs = 6000;
+constexpr uint8_t kGpsDebugRawSampleSize = 96;
+constexpr uint8_t kGpsDebugHexSampleByteCount = 32;
 constexpr uint16_t kThrottleZeroCalibrationMs = 1000;
 constexpr uint16_t kThrottleOpenCalibrationPauseMs = 2000;
 constexpr uint16_t kThrottleOpenCalibrationMs = 2000;
@@ -114,11 +128,18 @@ constexpr char kThrottleFullPrefsKey[] = "full_v";
 
 BLEServer *bleServer = nullptr;
 BLECharacteristic *canMainCharacteristic = nullptr;
+BLECharacteristic *gpsMainCharacteristic = nullptr;
+BLECharacteristic *gpsTimeCharacteristic = nullptr;
 Preferences throttleCalibrationPrefs;
 Adafruit_SSD1306 display(kDisplayWidth,
                          kDisplayHeight,
                          &Wire,
                          kDisplayResetPin);
+HardwareSerial gpsSerial(2);
+TinyGPSPlus gps;
+TinyGPSCustom gpsGgaFixQuality(gps, "GPGGA", 6);
+TinyGPSCustom gpsGpgsvSatellitesInView(gps, "GPGSV", 3);
+TinyGPSCustom gpsGngsvSatellitesInView(gps, "GNGSV", 3);
 
 bool bleClientConnected = false;
 bool bleWasConnected = false;
@@ -131,7 +152,6 @@ bool afrPidAllowed = true;
 uint16_t notifyIntervalMs = kDefaultNotifyIntervalMs;
 uint32_t lastCanNotifyMs = 0;
 uint32_t lastBleTxLogMs = 0;
-uint32_t lastStatusLogMs = 0;
 uint32_t lastLedToggleMs = 0;
 uint32_t lastLedIdleBlinkMs = 0;
 uint32_t lastAdcReadMs = 0;
@@ -141,6 +161,26 @@ uint32_t lastThrottleAdcReadMs = 0;
 uint32_t lastBrakePressureAdcReadMs = 0;
 uint32_t lastBatteryAdcReadMs = 0;
 uint32_t lastAfrAdcReadMs = 0;
+uint32_t lastGpsDebugLogMs = 0;
+uint32_t lastGpsDebugCharsProcessed = 0;
+uint32_t lastGpsDebugPassedChecksum = 0;
+uint32_t lastGpsDebugFailedChecksum = 0;
+uint32_t lastGpsDebugSentencesWithFix = 0;
+uint32_t lastGpsBaudProbeMs = 0;
+uint32_t lastGpsBaudProbePassedChecksum = 0;
+uint32_t gpsCurrentBaudRate = kGpsInitialBaudRate;
+uint16_t gpsDebugDollarCount = 0;
+uint16_t gpsDebugStarCount = 0;
+uint16_t gpsDebugLineFeedCount = 0;
+uint16_t gpsDebugUbxHeaderCount = 0;
+uint8_t gpsCurrentBaudRateIndex = 0;
+uint8_t gpsDebugPreviousByte = 0;
+uint8_t gpsDebugRawSampleLength = 0;
+uint8_t gpsDebugHexSampleLength = 0;
+char gpsDebugRawSample[kGpsDebugRawSampleSize + 1] = {};
+char gpsDebugHexSample[kGpsDebugHexSampleByteCount * 3 + 1] = {};
+uint32_t gpsLastDateHourValue = 0;
+uint8_t gpsSyncBits = 0;
 uint8_t adcI2cAddress = 0;
 uint8_t displayI2cAddress = 0;
 int16_t ads1115AdcRaw[4] = {};
@@ -190,6 +230,15 @@ bool ledIdleBlinkOn = false;
 bool ledIdleConnected = false;
 bool ledSensorActive = false;
 bool displayReady = false;
+bool gpsMainDirty = true;
+bool gpsTimeDirty = true;
+bool gpsDateHourInitialized = false;
+bool gpsLocationWasFresh = false;
+bool gpsAltitudeWasFresh = false;
+bool gpsSpeedWasFresh = false;
+bool gpsCourseWasFresh = false;
+bool gpsTimeWasFresh = false;
+bool gpsDateWasFresh = false;
 
 void IRAM_ATTR handleTachPulse() {
   const uint32_t nowUs = micros();
@@ -230,6 +279,19 @@ uint32_t readUint32Be(const uint8_t *data) {
 void writeUint16Be(uint8_t *data, uint16_t value) {
   data[0] = static_cast<uint8_t>(value >> 8);
   data[1] = static_cast<uint8_t>(value & 0xFF);
+}
+
+void writeUint24Be(uint8_t *data, uint32_t value) {
+  data[0] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  data[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  data[2] = static_cast<uint8_t>(value & 0xFF);
+}
+
+void writeUint32Be(uint8_t *data, uint32_t value) {
+  data[0] = static_cast<uint8_t>((value >> 24) & 0xFF);
+  data[1] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  data[2] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  data[3] = static_cast<uint8_t>(value & 0xFF);
 }
 
 void writeUint32Le(uint8_t *data, uint32_t value) {
@@ -1218,6 +1280,101 @@ void startTachInput() {
       kTachSignalTimeoutMs);
 }
 
+void writeGpsUbxByte(uint8_t value, uint8_t &checksumA, uint8_t &checksumB) {
+  gpsSerial.write(value);
+  checksumA += value;
+  checksumB += checksumA;
+}
+
+void writeGpsUbxPacket(uint8_t messageClass,
+                       uint8_t messageId,
+                       const uint8_t *payload,
+                       uint16_t payloadLength) {
+  uint8_t checksumA = 0;
+  uint8_t checksumB = 0;
+
+  gpsSerial.write(0xB5);
+  gpsSerial.write(0x62);
+  writeGpsUbxByte(messageClass, checksumA, checksumB);
+  writeGpsUbxByte(messageId, checksumA, checksumB);
+  writeGpsUbxByte(static_cast<uint8_t>(payloadLength & 0xFF),
+                  checksumA,
+                  checksumB);
+  writeGpsUbxByte(static_cast<uint8_t>(payloadLength >> 8),
+                  checksumA,
+                  checksumB);
+
+  for (uint16_t i = 0; i < payloadLength; ++i) {
+    writeGpsUbxByte(payload[i], checksumA, checksumB);
+  }
+
+  gpsSerial.write(checksumA);
+  gpsSerial.write(checksumB);
+  gpsSerial.flush();
+}
+
+void sendGpsUbxSetUartNmea() {
+  uint8_t payload[] = {
+      0x01, 0x00,              // UART1
+      0x00, 0x00,              // txReady disabled
+      0xD0, 0x08, 0x00, 0x00,  // 8N1
+      0x00, 0x00, 0x00, 0x00,  // baud, filled below
+      0x03, 0x00,              // input: UBX + NMEA
+      0x02, 0x00,              // output: NMEA
+      0x00, 0x00,              // flags
+      0x00, 0x00               // reserved
+  };
+  writeUint32Le(payload + 8, kGpsTargetBaudRate);
+
+  writeGpsUbxPacket(0x06, 0x00, payload, sizeof(payload));
+}
+
+void beginGpsSerial(uint32_t baudRate) {
+  gpsCurrentBaudRate = baudRate;
+  gpsSerial.begin(gpsCurrentBaudRate, SERIAL_8N1, kGpsRxPin, kGpsTxPin);
+}
+
+void configureGpsAtCurrentBaud(const char *reason) {
+  sendGpsUbxSetUartNmea();
+  Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target NMEA %lu baud (%s)\n",
+                static_cast<unsigned long>(gpsCurrentBaudRate),
+                static_cast<unsigned long>(kGpsTargetBaudRate),
+                reason);
+
+  if (gpsCurrentBaudRate != kGpsTargetBaudRate) {
+    delay(50);
+    beginGpsSerial(kGpsTargetBaudRate);
+  }
+}
+
+void configureGpsAtCommonBaudRates(const char *reason) {
+  for (uint8_t i = 0; i < kGpsBaudRateCount; ++i) {
+    beginGpsSerial(kGpsBaudRates[i]);
+    delay(50);
+    sendGpsUbxSetUartNmea();
+    Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target NMEA %lu baud (%s)\n",
+                  static_cast<unsigned long>(gpsCurrentBaudRate),
+                  static_cast<unsigned long>(kGpsTargetBaudRate),
+                  reason);
+  }
+
+  beginGpsSerial(kGpsTargetBaudRate);
+}
+
+void startGps() {
+  gpsCurrentBaudRateIndex = 0;
+  beginGpsSerial(kGpsTargetBaudRate);
+  const uint32_t now = millis();
+  lastGpsDebugLogMs = now;
+  lastGpsBaudProbeMs = now;
+
+  Serial.printf("GPS UART2 started: GY-NEO6MV2 TX -> ESP32 GPIO%u RX2, ESP32 GPIO%u TX2 -> GPS RX, baud=%lu\n",
+                kGpsRxPin,
+                kGpsTxPin,
+                static_cast<unsigned long>(gpsCurrentBaudRate));
+  configureGpsAtCommonBaudRates("startup");
+}
+
 void formatDisplayAdsVoltageLine(char *line,
                                  size_t lineSize,
                                  const char *label,
@@ -1315,25 +1472,13 @@ void printAdcReadings(uint32_t now) {
   updateAfrAdcState(rawValues[kAfrAdcChannel], volts[kAfrAdcChannel]);
 
   Serial.printf(
-      "ADC ADS1115 A0=%d %.3fV filtered=%.3fV throttle=%.1f%%, A1=%d %.3fV brake=%.1f bar, A2=%d %.3fV signal=%.3fV AFR=%.2f, A3=%d %.3fV unused; ESP32 GPIO%u=%s %.3fV raw=%d battery=%.3fV filtered=%.3fV\n",
-      rawValues[0],
-      volts[0],
-      throttleFilteredVolts,
+      "ADC throttle A0=%.3fV -> %.1f%%, brake A1=%.3fV -> %.1f bar, AFR A2=%.3fV -> %.2f, battery=%.3fV\n",
+      volts[kThrottleAdcChannel],
       throttlePercent,
-      rawValues[1],
-      volts[1],
+      volts[kBrakePressureAdcChannel],
       brakePressureBar,
-      rawValues[2],
-      volts[2],
-      afrSignalVolts,
+      volts[kAfrAdcChannel],
       afr,
-      rawValues[3],
-      volts[3],
-      kBatteryAdcPin,
-      batteryAdcValid ? "ok" : "missing",
-      batteryAdcVolts,
-      batteryAdcRaw,
-      batteryMeasuredVolts,
       batteryVolts);
 }
 
@@ -1355,6 +1500,493 @@ uint16_t rpmToUint16(float rpm) {
 uint16_t afrToCentiAfr(float afr) {
   afr = constrain(afr, kAfrAtZeroVolts, kAfrCalibrationHigh);
   return static_cast<uint16_t>(lroundf(afr * 100.0F));
+}
+
+bool isGpsLocationFresh() {
+  return gps.location.isValid() && gps.location.age() <= kGpsFreshAgeMs;
+}
+
+bool isGpsAltitudeFresh() {
+  return gps.altitude.isValid() && gps.altitude.age() <= kGpsFreshAgeMs;
+}
+
+bool isGpsSpeedFresh() {
+  return gps.speed.isValid() && gps.speed.age() <= kGpsFreshAgeMs;
+}
+
+bool isGpsCourseFresh() {
+  return gps.course.isValid() && gps.course.age() <= kGpsFreshAgeMs;
+}
+
+bool isGpsTimeFresh() {
+  return gps.time.isValid() && gps.time.age() <= kGpsFreshAgeMs;
+}
+
+bool isGpsDateFresh() {
+  return gps.date.isValid() && gps.date.age() <= kGpsFreshAgeMs;
+}
+
+void formatGpsUnsigned(char *buffer,
+                       size_t bufferSize,
+                       bool valid,
+                       uint32_t value) {
+  if (!valid) {
+    snprintf(buffer, bufferSize, "--");
+    return;
+  }
+
+  snprintf(buffer, bufferSize, "%lu", static_cast<unsigned long>(value));
+}
+
+void formatGpsSatellitesInView(char *buffer, size_t bufferSize) {
+  if (gpsGpgsvSatellitesInView.isValid() &&
+      gpsGpgsvSatellitesInView.age() <= kGpsFreshAgeMs) {
+    snprintf(buffer, bufferSize, "%u", atoi(gpsGpgsvSatellitesInView.value()));
+    return;
+  }
+
+  if (gpsGngsvSatellitesInView.isValid() &&
+      gpsGngsvSatellitesInView.age() <= kGpsFreshAgeMs) {
+    snprintf(buffer, bufferSize, "%u", atoi(gpsGngsvSatellitesInView.value()));
+    return;
+  }
+
+  snprintf(buffer, bufferSize, "--");
+}
+
+void formatGpsFloat(char *buffer,
+                    size_t bufferSize,
+                    bool valid,
+                    double value,
+                    uint8_t decimals) {
+  if (!valid) {
+    snprintf(buffer, bufferSize, "--");
+    return;
+  }
+
+  char format[8] = {};
+  snprintf(format, sizeof(format), "%%.%uf", decimals);
+  snprintf(buffer, bufferSize, format, value);
+}
+
+const char *gpsDebugState(uint32_t charsDelta,
+                          uint32_t passedDelta,
+                          uint32_t failedDelta,
+                          uint16_t ubxHeaderCount) {
+  if (charsDelta == 0) {
+    return "no_uart";
+  }
+  if (ubxHeaderCount > 0 && passedDelta == 0) {
+    return "ubx_binary";
+  }
+  if (passedDelta == 0 && failedDelta > 0) {
+    return "bad_nmea";
+  }
+  if (!isGpsLocationFresh()) {
+    return "no_fix";
+  }
+
+  return "fix";
+}
+
+void appendGpsDebugHexByte(uint8_t value) {
+  if (gpsDebugHexSampleLength >= kGpsDebugHexSampleByteCount) {
+    return;
+  }
+
+  const size_t offset = static_cast<size_t>(gpsDebugHexSampleLength) * 3;
+  snprintf(gpsDebugHexSample + offset,
+           sizeof(gpsDebugHexSample) - offset,
+           "%02X ",
+           value);
+  ++gpsDebugHexSampleLength;
+}
+
+void captureGpsDebugByte(char value) {
+  const uint8_t rawValue = static_cast<uint8_t>(value);
+  if (gpsDebugPreviousByte == 0xB5 && rawValue == 0x62) {
+    ++gpsDebugUbxHeaderCount;
+  }
+  gpsDebugPreviousByte = rawValue;
+  appendGpsDebugHexByte(rawValue);
+
+  if (value == '$') {
+    ++gpsDebugDollarCount;
+  } else if (value == '*') {
+    ++gpsDebugStarCount;
+  } else if (value == '\n') {
+    ++gpsDebugLineFeedCount;
+  }
+
+  if (gpsDebugRawSampleLength >= kGpsDebugRawSampleSize) {
+    return;
+  }
+
+  if (value == '\r') {
+    return;
+  }
+
+  if (value == '\n') {
+    gpsDebugRawSample[gpsDebugRawSampleLength++] = '|';
+  } else if (value >= 32 && value <= 126) {
+    gpsDebugRawSample[gpsDebugRawSampleLength++] = value;
+  } else {
+    gpsDebugRawSample[gpsDebugRawSampleLength++] = '.';
+  }
+  gpsDebugRawSample[gpsDebugRawSampleLength] = '\0';
+}
+
+void updateGpsBaudProbe(uint32_t now) {
+  const uint32_t passedChecksum = gps.passedChecksum();
+  if (passedChecksum > 0) {
+    if (passedChecksum != lastGpsBaudProbePassedChecksum) {
+      lastGpsBaudProbePassedChecksum = passedChecksum;
+      lastGpsBaudProbeMs = now;
+    }
+    return;
+  }
+
+  if (now - lastGpsBaudProbeMs < kGpsBaudProbeIntervalMs) {
+    return;
+  }
+
+  lastGpsBaudProbeMs = now;
+  const uint32_t probeBaudRate = kGpsBaudRates[gpsCurrentBaudRateIndex];
+  beginGpsSerial(probeBaudRate);
+  delay(50);
+  configureGpsAtCurrentBaud("baud probe");
+  gpsCurrentBaudRateIndex =
+      (gpsCurrentBaudRateIndex + 1) % kGpsBaudRateCount;
+}
+
+uint32_t gpsTimeFromHourStart() {
+  if (!isGpsTimeFresh()) {
+    return 0;
+  }
+
+  return static_cast<uint32_t>(gps.time.minute()) * 30000UL +
+         static_cast<uint32_t>(gps.time.second()) * 500UL +
+         static_cast<uint32_t>(gps.time.centisecond()) * 5UL;
+}
+
+uint32_t gpsDateHourValue() {
+  if (!isGpsDateFresh() || !isGpsTimeFresh()) {
+    return 0;
+  }
+
+  const uint16_t year =
+      static_cast<uint16_t>(constrain(gps.date.year(), 2000, 2099));
+  const uint8_t month =
+      static_cast<uint8_t>(constrain(gps.date.month(), 1, 12));
+  const uint8_t day =
+      static_cast<uint8_t>(constrain(gps.date.day(), 1, 31));
+  const uint8_t hour = min<uint8_t>(gps.time.hour(), 23);
+
+  return static_cast<uint32_t>(year - 2000) * 8928UL +
+         static_cast<uint32_t>(month - 1) * 744UL +
+         static_cast<uint32_t>(day - 1) * 24UL +
+         hour;
+}
+
+void syncGpsDateHourValue() {
+  const uint32_t nextDateHourValue = gpsDateHourValue();
+  if (!gpsDateHourInitialized) {
+    gpsDateHourInitialized = true;
+    gpsLastDateHourValue = nextDateHourValue;
+    gpsTimeDirty = true;
+    return;
+  }
+
+  if (nextDateHourValue != gpsLastDateHourValue) {
+    gpsLastDateHourValue = nextDateHourValue;
+    gpsSyncBits = (gpsSyncBits + 1) & 0x07;
+    gpsTimeDirty = true;
+  }
+}
+
+void updateGpsFreshnessState() {
+  const bool locationFresh = isGpsLocationFresh();
+  const bool altitudeFresh = isGpsAltitudeFresh();
+  const bool speedFresh = isGpsSpeedFresh();
+  const bool courseFresh = isGpsCourseFresh();
+  const bool timeFresh = isGpsTimeFresh();
+  const bool dateFresh = isGpsDateFresh();
+
+  if (locationFresh != gpsLocationWasFresh ||
+      altitudeFresh != gpsAltitudeWasFresh ||
+      speedFresh != gpsSpeedWasFresh ||
+      courseFresh != gpsCourseWasFresh ||
+      timeFresh != gpsTimeWasFresh) {
+    gpsMainDirty = true;
+  }
+
+  if (timeFresh != gpsTimeWasFresh || dateFresh != gpsDateWasFresh) {
+    gpsTimeDirty = true;
+  }
+
+  gpsLocationWasFresh = locationFresh;
+  gpsAltitudeWasFresh = altitudeFresh;
+  gpsSpeedWasFresh = speedFresh;
+  gpsCourseWasFresh = courseFresh;
+  gpsTimeWasFresh = timeFresh;
+  gpsDateWasFresh = dateFresh;
+}
+
+uint8_t gpsFixQuality() {
+  if (gpsGgaFixQuality.isValid() && gpsGgaFixQuality.age() <= kGpsFreshAgeMs) {
+    return min<uint8_t>(static_cast<uint8_t>(atoi(gpsGgaFixQuality.value())), 3);
+  }
+
+  return isGpsLocationFresh() ? 1 : 0;
+}
+
+uint8_t gpsLockedSatellites() {
+  if (!gps.satellites.isValid() || gps.satellites.age() > kGpsFreshAgeMs) {
+    return 0x3F;
+  }
+
+  return min<uint8_t>(static_cast<uint8_t>(gps.satellites.value()), 0x3E);
+}
+
+uint8_t gpsHdopRaw() {
+  if (!gps.hdop.isValid() || gps.hdop.age() > kGpsFreshAgeMs) {
+    return 0xFF;
+  }
+
+  const long hdopTenths = lround(gps.hdop.hdop() * 10.0);
+  return static_cast<uint8_t>(constrain(hdopTenths, 0L, 0xFEL));
+}
+
+uint32_t gpsLatLonRaw(double degrees) {
+  return static_cast<uint32_t>(static_cast<int32_t>(
+      llround(degrees * 10000000.0)));
+}
+
+uint16_t gpsAltitudeRaw() {
+  if (!isGpsAltitudeFresh()) {
+    return 0xFFFF;
+  }
+
+  const double meters = gps.altitude.meters();
+  const double shiftedMeters = meters + 500.0;
+  if (shiftedMeters >= 0.0 && shiftedMeters <= 6053.5) {
+    return static_cast<uint16_t>(llround(shiftedMeters * 10.0)) & 0x7FFF;
+  }
+
+  return (static_cast<uint16_t>(llround(shiftedMeters)) & 0x7FFF) | 0x8000;
+}
+
+uint16_t gpsSpeedRaw() {
+  if (!isGpsSpeedFresh()) {
+    return 0xFFFF;
+  }
+
+  const double speedKmph = max(0.0, gps.speed.kmph());
+  if (speedKmph <= 655.35) {
+    return static_cast<uint16_t>(llround(speedKmph * 100.0)) & 0x7FFF;
+  }
+
+  return (static_cast<uint16_t>(llround(speedKmph * 10.0)) & 0x7FFF) | 0x8000;
+}
+
+uint16_t gpsBearingRaw() {
+  if (!isGpsCourseFresh()) {
+    return 0xFFFF;
+  }
+
+  double bearingDegrees = fmod(gps.course.deg(), 360.0);
+  if (bearingDegrees < 0.0) {
+    bearingDegrees += 360.0;
+  }
+
+  return static_cast<uint16_t>(llround(bearingDegrees * 100.0));
+}
+
+void buildGpsMainPacket(uint8_t *packet) {
+  memset(packet, 0, 20);
+  const uint32_t syncTime =
+      (static_cast<uint32_t>(gpsSyncBits) << 21) |
+      (gpsTimeFromHourStart() & 0x1FFFFF);
+  writeUint24Be(packet, syncTime);
+
+  packet[3] = static_cast<uint8_t>((gpsFixQuality() << 6) |
+                                   (gpsLockedSatellites() & 0x3F));
+
+  if (isGpsLocationFresh()) {
+    writeUint32Be(packet + 4, gpsLatLonRaw(gps.location.lat()));
+    writeUint32Be(packet + 8, gpsLatLonRaw(gps.location.lng()));
+  } else {
+    writeUint32Be(packet + 4, 0x7FFFFFFFUL);
+    writeUint32Be(packet + 8, 0x7FFFFFFFUL);
+  }
+
+  writeUint16Be(packet + 12, gpsAltitudeRaw());
+  writeUint16Be(packet + 14, gpsSpeedRaw());
+  writeUint16Be(packet + 16, gpsBearingRaw());
+  packet[18] = gpsHdopRaw();
+  packet[19] = 0xFF;
+}
+
+void buildGpsTimePacket(uint8_t *packet) {
+  memset(packet, 0, 3);
+  const uint32_t syncDateHour =
+      (static_cast<uint32_t>(gpsSyncBits) << 21) |
+      (gpsLastDateHourValue & 0x1FFFFF);
+  writeUint24Be(packet, syncDateHour);
+}
+
+void updateGpsCharacteristicValues(bool notify) {
+  syncGpsDateHourValue();
+
+  if (gpsTimeCharacteristic != nullptr && gpsTimeDirty) {
+    uint8_t packet[3] = {};
+    buildGpsTimePacket(packet);
+    gpsTimeCharacteristic->setValue(packet, sizeof(packet));
+    if (notify && bleClientConnected) {
+      gpsTimeCharacteristic->notify();
+    }
+    gpsTimeDirty = false;
+  }
+
+  if (gpsMainCharacteristic != nullptr && gpsMainDirty) {
+    uint8_t packet[20] = {};
+    buildGpsMainPacket(packet);
+    gpsMainCharacteristic->setValue(packet, sizeof(packet));
+    if (notify && bleClientConnected) {
+      gpsMainCharacteristic->notify();
+    }
+    gpsMainDirty = false;
+  }
+}
+
+void printGpsDebugLog(uint32_t now) {
+  if (now - lastGpsDebugLogMs < kGpsDebugLogIntervalMs) {
+    return;
+  }
+
+  lastGpsDebugLogMs = now;
+
+  const uint32_t charsProcessed = gps.charsProcessed();
+  const uint32_t passedChecksum = gps.passedChecksum();
+  const uint32_t failedChecksum = gps.failedChecksum();
+  const uint32_t sentencesWithFix = gps.sentencesWithFix();
+  const uint32_t charsDelta = charsProcessed - lastGpsDebugCharsProcessed;
+  const uint32_t passedDelta = passedChecksum - lastGpsDebugPassedChecksum;
+  const uint32_t failedDelta = failedChecksum - lastGpsDebugFailedChecksum;
+  const uint32_t fixDelta = sentencesWithFix - lastGpsDebugSentencesWithFix;
+  const uint16_t dollarCount = gpsDebugDollarCount;
+  const uint16_t starCount = gpsDebugStarCount;
+  const uint16_t lineFeedCount = gpsDebugLineFeedCount;
+  const uint16_t ubxHeaderCount = gpsDebugUbxHeaderCount;
+
+  lastGpsDebugCharsProcessed = charsProcessed;
+  lastGpsDebugPassedChecksum = passedChecksum;
+  lastGpsDebugFailedChecksum = failedChecksum;
+  lastGpsDebugSentencesWithFix = sentencesWithFix;
+
+  char satellites[8] = {};
+  char satellitesInView[8] = {};
+  char hdop[8] = {};
+  char latitude[16] = {};
+  char longitude[16] = {};
+  char speed[12] = {};
+  char course[12] = {};
+  formatGpsUnsigned(satellites,
+                    sizeof(satellites),
+                    gps.satellites.isValid(),
+                    gps.satellites.value());
+  formatGpsSatellitesInView(satellitesInView, sizeof(satellitesInView));
+  formatGpsFloat(hdop,
+                 sizeof(hdop),
+                 gps.hdop.isValid(),
+                 gps.hdop.hdop(),
+                 1);
+  formatGpsFloat(latitude,
+                 sizeof(latitude),
+                 isGpsLocationFresh(),
+                 gps.location.lat(),
+                 7);
+  formatGpsFloat(longitude,
+                 sizeof(longitude),
+                 isGpsLocationFresh(),
+                 gps.location.lng(),
+                 7);
+  formatGpsFloat(speed,
+                 sizeof(speed),
+                 isGpsSpeedFresh(),
+                 gps.speed.kmph(),
+                 2);
+  formatGpsFloat(course,
+                 sizeof(course),
+                 isGpsCourseFresh(),
+                 gps.course.deg(),
+                 2);
+
+  const char *state =
+      gpsDebugState(charsDelta, passedDelta, failedDelta, ubxHeaderCount);
+  if (passedChecksum > 0) {
+    Serial.printf(
+        "GPS diag state=%s baud=%lu ok=%lu (+%lu), fix_sent=%lu (+%lu), view=%s, used=%s, hdop=%s, lat=%s, lon=%s, speed=%s km/h, course=%s deg\n",
+        state,
+        static_cast<unsigned long>(gpsCurrentBaudRate),
+        static_cast<unsigned long>(passedChecksum),
+        static_cast<unsigned long>(passedDelta),
+        static_cast<unsigned long>(sentencesWithFix),
+        static_cast<unsigned long>(fixDelta),
+        satellitesInView,
+        satellites,
+        hdop,
+        latitude,
+        longitude,
+        speed,
+        course);
+  } else {
+    Serial.printf(
+        "GPS diag state=%s RX=GPIO%u baud=%lu chars=%lu (+%lu), ok=%lu (+%lu), checksum_fail=%lu (+%lu), $=%u, *=%u, lf=%u, ubx=%u, raw=\"%s\", hex=\"%s\"\n",
+        state,
+        kGpsRxPin,
+        static_cast<unsigned long>(gpsCurrentBaudRate),
+        static_cast<unsigned long>(charsProcessed),
+        static_cast<unsigned long>(charsDelta),
+        static_cast<unsigned long>(passedChecksum),
+        static_cast<unsigned long>(passedDelta),
+        static_cast<unsigned long>(failedChecksum),
+        static_cast<unsigned long>(failedDelta),
+        dollarCount,
+        starCount,
+        lineFeedCount,
+        ubxHeaderCount,
+        gpsDebugRawSample,
+        gpsDebugHexSample);
+  }
+
+  gpsDebugDollarCount = 0;
+  gpsDebugStarCount = 0;
+  gpsDebugLineFeedCount = 0;
+  gpsDebugUbxHeaderCount = 0;
+  gpsDebugRawSampleLength = 0;
+  gpsDebugHexSampleLength = 0;
+  gpsDebugRawSample[0] = '\0';
+  gpsDebugHexSample[0] = '\0';
+}
+
+void updateGpsFromSerial(uint32_t now) {
+  while (gpsSerial.available() > 0) {
+    const char value = static_cast<char>(gpsSerial.read());
+    captureGpsDebugByte(value);
+    if (gps.encode(value)) {
+      gpsMainDirty = true;
+    }
+  }
+
+  updateGpsFreshnessState();
+
+  if (gpsMainDirty || gpsTimeDirty) {
+    updateGpsCharacteristicValues(true);
+  }
+
+  printGpsDebugLog(now);
+  updateGpsBaudProbe(now);
 }
 
 bool shouldSendPid(uint32_t pid) {
@@ -1393,37 +2025,22 @@ void publishTelemetry(float pressureBar,
   const uint16_t engineRpmRaw = rpmToUint16(rpm);
   const uint16_t afrCentivalue = afrToCentiAfr(afr);
 
-  const bool brakeSent = publishCanValue(kBrakePressurePid, pressureCentibar);
-  const bool throttleSent = publishCanValue(kThrottlePositionPid, throttleCentipercent);
-  const bool batterySent = publishCanValue(kBatteryVoltagePid, batteryMillivolts);
-  const bool rpmSent = publishCanValue(kEngineRpmPid, engineRpmRaw);
-  const bool afrSent = publishCanValue(kAfrPid, afrCentivalue);
+  publishCanValue(kBrakePressurePid, pressureCentibar);
+  publishCanValue(kThrottlePositionPid, throttleCentipercent);
+  publishCanValue(kBatteryVoltagePid, batteryMillivolts);
+  publishCanValue(kEngineRpmPid, engineRpmRaw);
+  publishCanValue(kAfrPid, afrCentivalue);
 
   const uint32_t now = millis();
   if (now - lastBleTxLogMs >= kBleTxLogIntervalMs) {
     lastBleTxLogMs = now;
     Serial.printf(
-        "BLE TX brake=%s PID=0x%08lX pressure=%.2f bar (%u), throttle=%s PID=0x%08lX throttle=%.2f %% (%u), battery=%s PID=0x%08lX voltage=%.3f V (%u mV), rpm=%s PID=0x%08lX engine=%.0f rpm (%u), afr=%s PID=0x%08lX value=%.2f (%u)\n",
-        brakeSent ? "sent" : "filtered",
-        static_cast<unsigned long>(kBrakePressurePid),
+        "BLE TX brake=%5.1f bar, throttle=%5.1f%%, battery=%6.3fV, rpm=%5.0f, AFR=%5.2f\n",
         pressureBar,
-        pressureCentibar,
-        throttleSent ? "sent" : "filtered",
-        static_cast<unsigned long>(kThrottlePositionPid),
         throttlePercent,
-        throttleCentipercent,
-        batterySent ? "sent" : "filtered",
-        static_cast<unsigned long>(kBatteryVoltagePid),
         batteryVolts,
-        batteryMillivolts,
-        rpmSent ? "sent" : "filtered",
-        static_cast<unsigned long>(kEngineRpmPid),
         rpm,
-        engineRpmRaw,
-        afrSent ? "sent" : "filtered",
-        static_cast<unsigned long>(kAfrPid),
-        afr,
-        afrCentivalue);
+        afr);
   }
 }
 
@@ -1519,10 +2136,21 @@ void startRaceChronoBle() {
       BLECharacteristic::PROPERTY_WRITE);
   canFilterCharacteristic->setCallbacks(new RaceChronoCanFilterCallbacks());
 
+  gpsMainCharacteristic = raceChronoService->createCharacteristic(
+      kGpsMainCharacteristicUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  gpsMainCharacteristic->addDescriptor(new BLE2902());
+
+  gpsTimeCharacteristic = raceChronoService->createCharacteristic(
+      kGpsTimeCharacteristicUuid,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  gpsTimeCharacteristic->addDescriptor(new BLE2902());
+
   uint8_t initialPacket[8] = {};
   writeUint32Le(initialPacket, kBrakePressurePid);
   writeUint16Be(initialPacket + 4, pressureBarToCentibar(brakePressureBar));
   canMainCharacteristic->setValue(initialPacket, sizeof(initialPacket));
+  updateGpsCharacteristicValues(false);
 
   raceChronoService->start();
 
@@ -1554,8 +2182,10 @@ void setup() {
                 static_cast<unsigned long>(kEngineRpmPid));
   Serial.printf("RaceChrono BLE CAN PID 0x%08lX: AFR, centi-AFR\n",
                 static_cast<unsigned long>(kAfrPid));
+  Serial.printf("RaceChrono BLE GPS: native GPS feature on characteristics 0x0003/0x0004\n");
 
   loadThrottleCalibration();
+  startGps();
   startBatteryAdc();
   startTachInput();
   startAdc();
@@ -1573,6 +2203,7 @@ void loop() {
   updateAfrFromAdc(now);
   updateBatteryFromAdc(now);
   updateEngineRpm(now);
+  updateGpsFromSerial(now);
   updateLedIdleBlink(now);
   updateDisplay(now);
 
@@ -1593,39 +2224,5 @@ void loop() {
   if (bleClientConnected && !bleWasConnected) {
     Serial.println("BLE client connected");
     bleWasConnected = true;
-  }
-
-  if (now - lastStatusLogMs >= kStatusLogIntervalMs) {
-    lastStatusLogMs = now;
-
-    Serial.printf(
-        "uptime=%lu ms, free_heap=%u bytes, cpu=%u MHz, ble=%s, brake=%.1f bar (A1=%s %.3fV raw=%d), throttle=%.1f %% (A0=%s %.3fV raw=%d), battery=%.3f V filtered (GPIO%u=%s %.3fV instant=%.3f V raw=%d), rpm=%s %.0f (GPIO%u pulses/rev=%.2f), afr=%s %.2f (A2=%.3fV signal=%.3fV raw=%d)\n",
-        static_cast<unsigned long>(now),
-        ESP.getFreeHeap(),
-        ESP.getCpuFreqMHz(),
-        bleClientConnected ? "connected" : "advertising",
-        brakePressureBar,
-        brakePressureAdcValid ? "ok" : "missing",
-        brakePressureAdcVolts,
-        brakePressureAdcRaw,
-        throttlePercent,
-        throttleAdcValid ? "ok" : "missing",
-        throttleAdcVolts,
-        throttleAdcRaw,
-        batteryVolts,
-        kBatteryAdcPin,
-        batteryAdcValid ? "ok" : "missing",
-        batteryAdcVolts,
-        batteryMeasuredVolts,
-        batteryAdcRaw,
-        engineRpmValid ? "ok" : "missing",
-        engineRpm,
-        kTachInputPin,
-        kIgnitionPulsesPerRevolution,
-        afrAdcValid ? "ok" : "missing",
-        afr,
-        afrAdcVolts,
-        afrSignalVolts,
-        afrAdcRaw);
   }
 }
