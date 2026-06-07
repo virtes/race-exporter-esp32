@@ -12,7 +12,9 @@ ADS1115 A2 -> ESP32`, напряжение АКБ через делитель н
 Дроссель публикуется как CAN PID `258`, давление тормоза публикуется как
 CAN PID `257`, напряжение АКБ публикуется как CAN PID `259`, обороты двигателя
 публикуются как CAN PID `260`, AFR публикуется как CAN PID `261`. Зеленый LED
-на `GPIO5` показывает калибровку и состояние BLE-подключения.
+на `GPIO5` показывает калибровку и состояние BLE-подключения. OLED-дисплей
+`SSD1306 128x64` на общей I2C-шине показывает `TH` (`ADS1115 A0`), `BR`
+(`ADS1115 A1`), `AF` (`ADS1115 A2`) и `BAT` четырьмя строками.
 
 ## Быстрый старт
 
@@ -93,6 +95,7 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | --- | --- | --- |
 | `esp32` | ESP32 | Основная плата, питание 3.3 В, I2C и BLE |
 | `adc` | ADS1115 | Внешний ADC для аналоговых сигналов дросселя, давления тормоза и AFR |
+| `oled_display` | SSD1306 128x64 OLED | I2C-дисплей для вывода `TH`, `BR`, `AF` и напряжения АКБ `BAT`, адрес `0x3C` или `0x3D` |
 | `throttle_sensor` | SS49E | Датчик открытия дросселя |
 | `brake_pressure_sensor` | Bosch 0265005303 | Датчик давления тормозной системы, питание 5 В |
 | `afr_controller` | AFR-контроллер | Источник аналогового сигнала AFR: `2.47 В = 15.3 AFR`, `4.764 В = 20 AFR` на выходе контроллера |
@@ -141,18 +144,22 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 | `ads-scl` | `ESP32 GPIO19` | `ADS1115 SCL` | `i2c_scl` | I2C clock, в коде `kAdcSclPin = 19` |
 | `ads-sda` | `ESP32 GPIO22` | `ADS1115 SDA` | `i2c_sda` | I2C data, в коде `kAdcSdaPin = 22` |
 | `ads-addr` | `ADS1115 ADDR` | `GND` | `i2c_addr` | Адрес ADS1115: `0x48` |
+| `display-power` | `ESP32 3V3` | `SSD1306 VCC` | `3v3` | Дисплей питается от 3.3 В |
+| `display-gnd` | `SSD1306 GND` | `GND` | `gnd` | Общая земля дисплея с ESP32/ADS1115 |
+| `display-scl` | `ESP32 GPIO19` | `SSD1306 SCL` | `i2c_scl` | Дисплей подключен параллельно `ADS1115 SCL` на общей I2C-шине |
+| `display-sda` | `ESP32 GPIO22` | `SSD1306 SDA` | `i2c_sda` | Дисплей подключен параллельно `ADS1115 SDA` на общей I2C-шине |
 
 ### Логические шины
 
 | Шина | Что объединяет |
 | --- | --- |
-| `gnd` | `ESP32 GND`, `ADS1115 GND`, `SS49E GND`, `AFR GND / signal GND`, `АКБ -`, `Повышатель IN-/OUT-`, `Bosch 0265005303 pin 1 (-)`, катод LED |
-| `3v3` | `ESP32 3V3`, `ADS1115 VDD`, `SS49E VCC` |
+| `gnd` | `ESP32 GND`, `ADS1115 GND`, `SSD1306 GND`, `SS49E GND`, `AFR GND / signal GND`, `АКБ -`, `Повышатель IN-/OUT-`, `Bosch 0265005303 pin 1 (-)`, катод LED |
+| `3v3` | `ESP32 3V3`, `ADS1115 VDD`, `SSD1306 VCC`, `SS49E VCC` |
 | `5v_boost` | `Повышатель OUT+`, `Bosch 0265005303 pin 3 (+)` |
 | `battery_plus` | `АКБ +` 1S LiPo, `Повышатель IN+` |
 | `battery_voltage_adc` | `Делитель напряжения АКБ средняя точка -> ESP32 GPIO34` |
 | `afr_adc` | `AFR analog out 0-5 В -> 20 кОм -> ADS1115 A2`, `ADS1115 A2 -> 20 кОм -> GND` |
-| `i2c` | `ESP32 GPIO19 -> ADS1115 SCL`, `ESP32 GPIO22 -> ADS1115 SDA` |
+| `i2c` | `ESP32 GPIO19 -> ADS1115 SCL и SSD1306 SCL`, `ESP32 GPIO22 -> ADS1115 SDA и SSD1306 SDA` |
 | `engine_rpm_input` | `ESP32 GPIO27`, `10 кОм pull-up к 3V3`, `PC817 pin 4`; `PC817 pin 3 -> ESP32 GND` |
 | `tach_coil_input` | `Импульсный вывод первички CDI-катушки -> 47 кОм -> PC817 pin 1`, `второй вывод первички CDI-катушки / возврат CDI -> PC817 pin 2`, защитный диод между `PC817 pin 1` и `pin 2` |
 
@@ -161,7 +168,13 @@ Settings -> Add other device -> Add other device -> RaceChrono DIY -> Bluetooth 
 - Все `GND` низковольтной схемы должны быть объединены. Сторона CDI
   тахо-входа (`первичка CDI-катушки`, вход `PC817 pin 1/2`) остается
   гальванически развязанной от `ESP32 GND`.
-- ADS1115 и SS49E питаются от `3V3`, не от `5V`.
+- ADS1115, SSD1306 и SS49E питаются от `3V3`, не от `5V`.
+- SSD1306 подключается к той же I2C-шине, что и ADS1115:
+  `GPIO19 -> SCL`, `GPIO22 -> SDA`. В прошивке дисплей ищется по адресам
+  `0x3C` и `0x3D`, а ADS1115 по адресам `0x48..0x4B`, поэтому штатный
+  SSD1306 не конфликтует с ADC. На дисплей выводятся 4 строки:
+  `TH` = `ADS1115 A0`, `BR` = `ADS1115 A1`, `AF` = `ADS1115 A2`,
+  `BAT` = напряжение АКБ после пересчета делителя.
 - Датчик давления Bosch `0265005303` питается от выхода повышателя `5V`;
   текущее замеренное питание для расчета давления: `5.11 В`.
 - Аналоговый выход AFR `0-5 В` подключается к `ADS1115 A2` только через

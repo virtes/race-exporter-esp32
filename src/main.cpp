@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -43,7 +45,13 @@ constexpr uint16_t kLedDisconnectedBlinkIntervalMs = 2000;
 constexpr float kLedThrottleThresholdPercent = 1.0F;
 constexpr uint8_t kAdcSdaPin = 22;
 constexpr uint8_t kAdcSclPin = 19;
-constexpr uint32_t kAdcI2cClockHz = 100000;
+constexpr uint32_t kAdcI2cClockHz = 400000;
+constexpr int8_t kDisplayResetPin = -1;
+constexpr uint8_t kDisplayWidth = 128;
+constexpr uint8_t kDisplayHeight = 64;
+constexpr uint8_t kDisplayPrimaryI2cAddress = 0x3C;
+constexpr uint8_t kDisplaySecondaryI2cAddress = 0x3D;
+constexpr uint16_t kDisplayUpdateIntervalMs = 500;
 constexpr uint16_t kAdcReadIntervalMs = 5000;
 constexpr uint16_t kAdcMissingLogIntervalMs = 5000;
 constexpr float kAds1115VoltsPerBit = 6.144F / 32768.0F;
@@ -107,6 +115,10 @@ constexpr char kThrottleFullPrefsKey[] = "full_v";
 BLEServer *bleServer = nullptr;
 BLECharacteristic *canMainCharacteristic = nullptr;
 Preferences throttleCalibrationPrefs;
+Adafruit_SSD1306 display(kDisplayWidth,
+                         kDisplayHeight,
+                         &Wire,
+                         kDisplayResetPin);
 
 bool bleClientConnected = false;
 bool bleWasConnected = false;
@@ -124,11 +136,16 @@ uint32_t lastLedToggleMs = 0;
 uint32_t lastLedIdleBlinkMs = 0;
 uint32_t lastAdcReadMs = 0;
 uint32_t lastAdcMissingLogMs = 0;
+uint32_t lastDisplayUpdateMs = 0;
 uint32_t lastThrottleAdcReadMs = 0;
 uint32_t lastBrakePressureAdcReadMs = 0;
 uint32_t lastBatteryAdcReadMs = 0;
 uint32_t lastAfrAdcReadMs = 0;
 uint8_t adcI2cAddress = 0;
+uint8_t displayI2cAddress = 0;
+int16_t ads1115AdcRaw[4] = {};
+float ads1115AdcVolts[4] = {};
+bool ads1115AdcValid[4] = {};
 int16_t throttleAdcRaw = 0;
 float throttleAdcVolts = 0.0F;
 float throttleFilteredVolts = 0.0F;
@@ -172,6 +189,7 @@ bool ledOn = false;
 bool ledIdleBlinkOn = false;
 bool ledIdleConnected = false;
 bool ledSensorActive = false;
+bool displayReady = false;
 
 void IRAM_ATTR handleTachPulse() {
   const uint32_t nowUs = micros();
@@ -250,6 +268,16 @@ bool readAds1115Register(uint8_t reg, int16_t &value) {
   return true;
 }
 
+void updateAds1115ChannelState(uint8_t channel, int16_t rawValue, float volts) {
+  if (channel > 3) {
+    return;
+  }
+
+  ads1115AdcRaw[channel] = rawValue;
+  ads1115AdcVolts[channel] = volts;
+  ads1115AdcValid[channel] = true;
+}
+
 bool readAds1115SingleEnded(uint8_t channel, int16_t &rawValue, float &volts) {
   if (channel > 3 || adcI2cAddress == 0) {
     return false;
@@ -271,6 +299,7 @@ bool readAds1115SingleEnded(uint8_t channel, int16_t &rawValue, float &volts) {
   }
 
   volts = static_cast<float>(rawValue) * kAds1115VoltsPerBit;
+  updateAds1115ChannelState(channel, rawValue, volts);
   return true;
 }
 
@@ -444,6 +473,12 @@ void resetTachPulseState() {
 }
 
 void invalidateAds1115Measurements() {
+  for (uint8_t channel = 0; channel < 4; ++channel) {
+    ads1115AdcRaw[channel] = 0;
+    ads1115AdcVolts[channel] = 0.0F;
+    ads1115AdcValid[channel] = false;
+  }
+
   invalidateThrottleAdc();
   invalidateBrakePressureAdc();
   invalidateAfrAdc();
@@ -1102,6 +1137,17 @@ uint8_t findAds1115Address() {
   return 0;
 }
 
+uint8_t findSsd1306Address() {
+  if (isI2cDevicePresent(kDisplayPrimaryI2cAddress)) {
+    return kDisplayPrimaryI2cAddress;
+  }
+  if (isI2cDevicePresent(kDisplaySecondaryI2cAddress)) {
+    return kDisplaySecondaryI2cAddress;
+  }
+
+  return 0;
+}
+
 void startAdc() {
   Wire.begin(kAdcSdaPin, kAdcSclPin);
   Wire.setClock(kAdcI2cClockHz);
@@ -1117,6 +1163,37 @@ void startAdc() {
       adcI2cAddress,
       kAdcSdaPin,
       kAdcSclPin);
+}
+
+void startDisplay() {
+  displayI2cAddress = findSsd1306Address();
+  if (displayI2cAddress == 0) {
+    Serial.printf("SSD1306 display not found on I2C SDA=%u SCL=%u\n",
+                  kAdcSdaPin,
+                  kAdcSclPin);
+    return;
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, displayI2cAddress, true, false)) {
+    Serial.printf("SSD1306 display init failed at 0x%02X\n",
+                  displayI2cAddress);
+    displayI2cAddress = 0;
+    return;
+  }
+
+  displayReady = true;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("ADS1115");
+  display.display();
+
+  Serial.printf(
+      "SSD1306 display found at 0x%02X, resolution=%ux%u, showing TH/BR/AF/BAT volts\n",
+      displayI2cAddress,
+      kDisplayWidth,
+      kDisplayHeight);
 }
 
 void startBatteryAdc() {
@@ -1139,6 +1216,61 @@ void startTachInput() {
       kTachInputPin,
       kIgnitionPulsesPerRevolution,
       kTachSignalTimeoutMs);
+}
+
+void formatDisplayAdsVoltageLine(char *line,
+                                 size_t lineSize,
+                                 const char *label,
+                                 uint8_t channel) {
+  if (channel <= 3 && ads1115AdcValid[channel]) {
+    snprintf(line, lineSize, "%s %.3fV", label, ads1115AdcVolts[channel]);
+    return;
+  }
+
+  snprintf(line, lineSize, "%s --.--V", label);
+}
+
+void formatDisplayBatteryLine(char *line, size_t lineSize) {
+  if (batteryAdcValid) {
+    snprintf(line, lineSize, "BAT %.2fV", batteryVolts);
+    return;
+  }
+
+  snprintf(line, lineSize, "BAT --.--V");
+}
+
+void updateDisplay(uint32_t now) {
+  if (!displayReady || now - lastDisplayUpdateMs < kDisplayUpdateIntervalMs) {
+    return;
+  }
+
+  lastDisplayUpdateMs = now;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+
+  char line[16] = {};
+  formatDisplayAdsVoltageLine(line, sizeof(line), "TH", kThrottleAdcChannel);
+  display.setCursor(0, 0);
+  display.print(line);
+
+  formatDisplayAdsVoltageLine(line,
+                              sizeof(line),
+                              "BR",
+                              kBrakePressureAdcChannel);
+  display.setCursor(0, 16);
+  display.print(line);
+
+  formatDisplayAdsVoltageLine(line, sizeof(line), "AF", kAfrAdcChannel);
+  display.setCursor(0, 32);
+  display.print(line);
+
+  formatDisplayBatteryLine(line, sizeof(line));
+  display.setCursor(0, 48);
+  display.print(line);
+
+  display.display();
 }
 
 void printAdcReadings(uint32_t now) {
@@ -1427,6 +1559,7 @@ void setup() {
   startBatteryAdc();
   startTachInput();
   startAdc();
+  startDisplay();
   calibrateThrottle();
   startRaceChronoBle();
   Serial.printf("BLE advertising as \"%s\"\n", kDeviceName);
@@ -1441,6 +1574,7 @@ void loop() {
   updateBatteryFromAdc(now);
   updateEngineRpm(now);
   updateLedIdleBlink(now);
+  updateDisplay(now);
 
   if (bleClientConnected && now - lastCanNotifyMs >= notifyIntervalMs) {
     lastCanNotifyMs = now;
