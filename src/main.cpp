@@ -15,12 +15,16 @@ constexpr char kCanFilterCharacteristicUuid[] = "00000002-0000-1000-8000-00805f9
 constexpr char kGpsMainCharacteristicUuid[] = "00000003-0000-1000-8000-00805f9b34fb";
 constexpr char kGpsTimeCharacteristicUuid[] = "00000004-0000-1000-8000-00805f9b34fb";
 
-constexpr uint32_t kBrakePressurePid = 0x00000101;
-constexpr uint32_t kThrottlePositionPid = 0x00000102;
-constexpr uint32_t kBatteryVoltagePid = 0x00000103;
-constexpr uint32_t kAfrPid = 0x00000105;
-constexpr uint16_t kDefaultNotifyIntervalMs = 20;
-constexpr uint16_t kMinNotifyIntervalMs = 1;
+constexpr uint32_t kTelemetryPid = 0x00000101;
+constexpr uint8_t kCanPacketPidLength = 4;
+constexpr uint8_t kCanMaxPayloadLength = 16;
+constexpr uint8_t kTelemetryPayloadLength = 8;
+constexpr uint8_t kTelemetryBrakePressureOffset = 0;
+constexpr uint8_t kTelemetryThrottlePositionOffset = 2;
+constexpr uint8_t kTelemetryAfrOffset = 4;
+constexpr uint8_t kTelemetryBatteryVoltageOffset = 6;
+constexpr uint16_t kDefaultNotifyIntervalMs = 50;
+constexpr uint16_t kMinNotifyIntervalMs = 50;
 constexpr uint16_t kBleReconnectQuietMs = 750;
 constexpr uint16_t kBleTxLogIntervalMs = 30000;
 constexpr uint16_t kMaxBrakePressureBar = 250;
@@ -47,19 +51,18 @@ constexpr uint8_t kAdcSdaPin = 22;
 constexpr uint8_t kAdcSclPin = 19;
 constexpr uint32_t kAdcI2cClockHz = 400000;
 constexpr uint16_t kAdcI2cTimeoutMs = 25;
-constexpr uint16_t kAdcReadIntervalMs = 5000;
+constexpr uint16_t kAdcLogIntervalMs = 5000;
 constexpr uint16_t kAdcMissingLogIntervalMs = 5000;
 constexpr float kAds1115VoltsPerBit = 6.144F / 32768.0F;
 constexpr uint8_t kThrottleAdcChannel = 0;
 constexpr uint8_t kBrakePressureAdcChannel = 1;
 constexpr uint8_t kAfrAdcChannel = 2;
-constexpr uint16_t kThrottleAdcReadIntervalMs = 20;
-constexpr uint16_t kBrakePressureAdcReadIntervalMs = 20;
-constexpr uint16_t kAfrAdcReadIntervalMs = 20;
+constexpr uint16_t kThrottleAdcReadIntervalMs = 50;
+constexpr uint16_t kBrakePressureAdcReadIntervalMs = 50;
+constexpr uint16_t kAfrAdcReadIntervalMs = 100;
 constexpr uint8_t kBatteryAdcPin = 35;
 constexpr uint8_t kBatteryAdcResolutionBits = 12;
 constexpr uint16_t kBatteryAdcReadIntervalMs = 1000;
-constexpr uint16_t kBatteryVoltageNotifyIntervalMs = 1000;
 constexpr uint8_t kBatteryAdcSampleCount = 8;
 constexpr uint8_t kGpsRxPin = 16;
 constexpr uint8_t kGpsTxPin = 17;
@@ -210,22 +213,18 @@ GpsUbxStreamParser gpsUbxStreamParser = {};
 bool bleClientConnected = false;
 bool bleWasConnected = false;
 bool allowAllPids = true;
-bool brakePressurePidAllowed = true;
-bool throttlePositionPidAllowed = true;
-bool batteryVoltagePidAllowed = true;
-bool afrPidAllowed = true;
+bool telemetryPidAllowed = true;
 uint16_t notifyIntervalMs = kDefaultNotifyIntervalMs;
 uint32_t bleConnectedAtMs = 0;
 uint32_t lastCanNotifyMs = 0;
 uint32_t lastBleTxLogMs = 0;
 uint32_t lastLedToggleMs = 0;
 uint32_t lastLedIdleBlinkMs = 0;
-uint32_t lastAdcReadMs = 0;
+uint32_t lastAdcLogMs = 0;
 uint32_t lastAdcMissingLogMs = 0;
 uint32_t lastThrottleAdcReadMs = 0;
 uint32_t lastBrakePressureAdcReadMs = 0;
 uint32_t lastBatteryAdcReadMs = 0;
-uint32_t lastBatteryVoltageNotifyMs = 0;
 uint32_t lastAfrAdcReadMs = 0;
 uint32_t lastGpsDebugLogMs = 0;
 uint32_t lastGpsDebugBytesProcessed = 0;
@@ -1748,37 +1747,19 @@ void printAdcReadings(uint32_t now) {
     return;
   }
 
-  if (now - lastAdcReadMs < kAdcReadIntervalMs) {
+  if (now - lastAdcLogMs < kAdcLogIntervalMs) {
     return;
   }
 
-  lastAdcReadMs = now;
-
-  int16_t rawValues[4] = {};
-  float volts[4] = {};
-  for (uint8_t channel = 0; channel < 4; ++channel) {
-    if (!readAds1115SingleEnded(channel, rawValues[channel], volts[channel])) {
-      Serial.printf("ADS1115 ADC read failed at 0x%02X, will retry scan\n", adcI2cAddress);
-      adcI2cAddress = 0;
-      invalidateAds1115Measurements();
-      return;
-    }
-  }
-
-  updateThrottleAdcState(rawValues[kThrottleAdcChannel],
-                         volts[kThrottleAdcChannel],
-                         false);
-  updateBrakePressureAdcState(rawValues[kBrakePressureAdcChannel],
-                              volts[kBrakePressureAdcChannel]);
-  updateAfrAdcState(rawValues[kAfrAdcChannel], volts[kAfrAdcChannel]);
+  lastAdcLogMs = now;
 
   Serial.printf(
       "ADC throttle A0=%.3fV -> %.1f%%, brake A1=%.3fV -> %.1f bar, AFR A2=%.3fV -> %.2f, battery GPIO%u raw=%d adc=%.3fV measured=%.3fV filtered=%.3fV\n",
-      volts[kThrottleAdcChannel],
+      throttleAdcVolts,
       throttlePercent,
-      volts[kBrakePressureAdcChannel],
+      brakePressureAdcVolts,
       brakePressureBar,
-      volts[kAfrAdcChannel],
+      afrAdcVolts,
       afr,
       kBatteryAdcPin,
       batteryAdcRaw,
@@ -2468,31 +2449,51 @@ void updateGpsFromSerial(uint32_t now) {
 }
 
 bool shouldSendPid(uint32_t pid) {
-  return allowAllPids ||
-         (pid == kBrakePressurePid && brakePressurePidAllowed) ||
-         (pid == kThrottlePositionPid && throttlePositionPidAllowed) ||
-         (pid == kBatteryVoltagePid && batteryVoltagePidAllowed) ||
-         (pid == kAfrPid && afrPidAllowed);
+  return allowAllPids || (pid == kTelemetryPid && telemetryPidAllowed);
 }
 
-bool publishCanValue(uint32_t pid, uint16_t rawValue) {
+bool publishCanPayload(uint32_t pid,
+                       const uint8_t *payload,
+                       size_t payloadLength) {
   if (!canSendBleNotification(canMainNotifyDescriptor) ||
       canMainCharacteristic == nullptr ||
+      payloadLength == 0 ||
+      payloadLength > kCanMaxPayloadLength ||
       !shouldSendPid(pid)) {
     return false;
   }
 
-  uint8_t packet[8] = {};
+  uint8_t packet[kCanPacketPidLength + kCanMaxPayloadLength] = {};
   writeUint32Le(packet, pid);
-  writeUint16Be(packet + 4, rawValue);
+  memcpy(packet + kCanPacketPidLength, payload, payloadLength);
 
-  canMainCharacteristic->setValue(packet, sizeof(packet));
+  canMainCharacteristic->setValue(packet, kCanPacketPidLength + payloadLength);
   canMainCharacteristic->notify();
   return true;
 }
 
 uint16_t normalizeNotifyInterval(uint16_t requestedIntervalMs) {
   return max<uint16_t>(kMinNotifyIntervalMs, requestedIntervalMs);
+}
+
+void buildTelemetryPayload(uint8_t *payload,
+                           float pressureBar,
+                           float throttlePercent,
+                           float afr,
+                           float batteryVolts) {
+  const uint16_t pressureCentibar = pressureBarToCentibar(pressureBar);
+  const uint16_t throttleCentipercent = static_cast<uint16_t>(
+      lroundf(constrain(throttlePercent, 0.0F, 100.0F) * 100.0F));
+  const uint16_t afrCentivalue = afrToCentiAfr(afr);
+  const uint16_t batteryMillivolts = voltsToMillivolts(batteryVolts);
+
+  memset(payload, 0, kTelemetryPayloadLength);
+  writeUint16Be(payload + kTelemetryBrakePressureOffset, pressureCentibar);
+  writeUint16Be(payload + kTelemetryThrottlePositionOffset,
+                throttleCentipercent);
+  writeUint16Be(payload + kTelemetryAfrOffset, afrCentivalue);
+  writeUint16Be(payload + kTelemetryBatteryVoltageOffset,
+                batteryMillivolts);
 }
 
 void setBleNotificationDescriptors(bool enabled) {
@@ -2507,21 +2508,15 @@ void setBleNotificationDescriptors(bool enabled) {
   }
 }
 
-void publishFastTelemetry(float pressureBar,
-                          float throttlePercent,
-                          float afr) {
-  const uint16_t pressureCentibar = pressureBarToCentibar(pressureBar);
-  const uint16_t throttleCentipercent =
-      static_cast<uint16_t>(lroundf(constrain(throttlePercent, 0.0F, 100.0F) * 100.0F));
-  const uint16_t afrCentivalue = afrToCentiAfr(afr);
+void publishTelemetry(float pressureBar,
+                      float throttlePercent,
+                      float afr,
+                      float batteryVolts) {
+  uint8_t payload[kTelemetryPayloadLength] = {};
+  buildTelemetryPayload(payload, pressureBar, throttlePercent, afr,
+                        batteryVolts);
 
-  publishCanValue(kBrakePressurePid, pressureCentibar);
-  publishCanValue(kThrottlePositionPid, throttleCentipercent);
-  publishCanValue(kAfrPid, afrCentivalue);
-}
-
-void publishBatteryVoltage(float batteryVolts) {
-  publishCanValue(kBatteryVoltagePid, voltsToMillivolts(batteryVolts));
+  publishCanPayload(kTelemetryPid, payload, sizeof(payload));
 }
 
 void printBleTxLog(uint32_t now,
@@ -2545,12 +2540,13 @@ bool publishGpsSynchronizedCanSnapshot(uint32_t now) {
     return false;
   }
 
-  gpsSynchronizedCanSnapshotPending = false;
-  if (!canSendBleNotification(canMainNotifyDescriptor)) {
+  if (!canSendBleNotification(canMainNotifyDescriptor) ||
+      now - lastCanNotifyMs < notifyIntervalMs) {
     return false;
   }
 
-  publishFastTelemetry(brakePressureBar, throttlePercent, afr);
+  gpsSynchronizedCanSnapshotPending = false;
+  publishTelemetry(brakePressureBar, throttlePercent, afr, batteryVolts);
   lastCanNotifyMs = now;
   printBleTxLog(now, brakePressureBar, throttlePercent, batteryVolts, afr);
   return true;
@@ -2561,8 +2557,6 @@ class RaceChronoServerCallbacks : public BLEServerCallbacks {
     bleClientConnected = true;
     bleConnectedAtMs = millis();
     lastCanNotifyMs = bleConnectedAtMs;
-    lastBatteryVoltageNotifyMs =
-        bleConnectedAtMs - kBatteryVoltageNotifyIntervalMs;
   }
 
   void onDisconnect(BLEServer *) override {
@@ -2584,20 +2578,14 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
 
     if (commandId == 0) {
       allowAllPids = false;
-      brakePressurePidAllowed = false;
-      throttlePositionPidAllowed = false;
-      batteryVoltagePidAllowed = false;
-      afrPidAllowed = false;
+      telemetryPidAllowed = false;
       Serial.println("RaceChrono filter: deny all PIDs");
       return;
     }
 
     if (commandId == 1 && length >= 3) {
       allowAllPids = true;
-      brakePressurePidAllowed = true;
-      throttlePositionPidAllowed = true;
-      batteryVoltagePidAllowed = true;
-      afrPidAllowed = true;
+      telemetryPidAllowed = true;
       const uint16_t requestedIntervalMs = readUint16Be(data + 1);
       notifyIntervalMs = normalizeNotifyInterval(requestedIntervalMs);
       Serial.printf(
@@ -2611,18 +2599,9 @@ class RaceChronoCanFilterCallbacks : public BLECharacteristicCallbacks {
       const uint16_t requestedIntervalMs = readUint16Be(data + 1);
       const uint16_t interval = normalizeNotifyInterval(requestedIntervalMs);
       const uint32_t pid = readUint32Be(data + 3);
-      const bool knownPid = pid == kBrakePressurePid ||
-                            pid == kThrottlePositionPid ||
-                            pid == kBatteryVoltagePid ||
-                            pid == kAfrPid;
-      if (pid == kBrakePressurePid) {
-        brakePressurePidAllowed = true;
-      } else if (pid == kThrottlePositionPid) {
-        throttlePositionPidAllowed = true;
-      } else if (pid == kBatteryVoltagePid) {
-        batteryVoltagePidAllowed = true;
-      } else if (pid == kAfrPid) {
-        afrPidAllowed = true;
+      const bool knownPid = pid == kTelemetryPid;
+      if (knownPid) {
+        telemetryPidAllowed = true;
       }
       if (knownPid) {
         notifyIntervalMs = interval;
@@ -2667,9 +2646,13 @@ void startRaceChronoBle() {
   gpsTimeNotifyDescriptor = new BLE2902();
   gpsTimeCharacteristic->addDescriptor(gpsTimeNotifyDescriptor);
 
-  uint8_t initialPacket[8] = {};
-  writeUint32Le(initialPacket, kBrakePressurePid);
-  writeUint16Be(initialPacket + 4, pressureBarToCentibar(brakePressureBar));
+  uint8_t initialPacket[kCanPacketPidLength + kTelemetryPayloadLength] = {};
+  writeUint32Le(initialPacket, kTelemetryPid);
+  buildTelemetryPayload(initialPacket + kCanPacketPidLength,
+                        brakePressureBar,
+                        throttlePercent,
+                        afr,
+                        batteryVolts);
   canMainCharacteristic->setValue(initialPacket, sizeof(initialPacket));
   updateGpsCharacteristicValues(false);
 
@@ -2693,14 +2676,9 @@ void setup() {
 
   Serial.println();
   Serial.println("racechrono-collector-esp32 started");
-  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: brake pressure, centibar\n",
-                static_cast<unsigned long>(kBrakePressurePid));
-  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: throttle position, centipercent\n",
-                static_cast<unsigned long>(kThrottlePositionPid));
-  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: battery voltage, millivolts\n",
-                static_cast<unsigned long>(kBatteryVoltagePid));
-  Serial.printf("RaceChrono BLE CAN PID 0x%08lX: AFR, centi-AFR\n",
-                static_cast<unsigned long>(kAfrPid));
+  Serial.printf(
+      "RaceChrono BLE CAN PID 0x%08lX: telemetry, brake@0 centibar, throttle@2 centipercent, AFR@4 centi-AFR, battery@6 millivolts\n",
+      static_cast<unsigned long>(kTelemetryPid));
   Serial.printf("RaceChrono BLE GPS: native GPS feature on characteristics 0x0003/0x0004\n");
 
   loadThrottleCalibration();
@@ -2725,21 +2703,9 @@ void loop() {
   updateLedIdleBlink(now);
 
   if (canSendBleNotification(canMainNotifyDescriptor)) {
-    bool canTelemetryPublished = false;
-
     if (now - lastCanNotifyMs >= notifyIntervalMs) {
       lastCanNotifyMs = now;
-      publishFastTelemetry(brakePressureBar, throttlePercent, afr);
-      canTelemetryPublished = true;
-    }
-
-    if (now - lastBatteryVoltageNotifyMs >= kBatteryVoltageNotifyIntervalMs) {
-      lastBatteryVoltageNotifyMs = now;
-      publishBatteryVoltage(batteryVolts);
-      canTelemetryPublished = true;
-    }
-
-    if (canTelemetryPublished) {
+      publishTelemetry(brakePressureBar, throttlePercent, afr, batteryVolts);
       printBleTxLog(now, brakePressureBar, throttlePercent, batteryVolts, afr);
     }
   }
