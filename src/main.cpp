@@ -6,7 +6,6 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <Preferences.h>
-#include <TinyGPSPlus.h>
 #include <Wire.h>
 
 namespace {
@@ -49,6 +48,7 @@ constexpr float kLedThrottleThresholdPercent = 1.0F;
 constexpr uint8_t kAdcSdaPin = 22;
 constexpr uint8_t kAdcSclPin = 19;
 constexpr uint32_t kAdcI2cClockHz = 400000;
+constexpr uint16_t kAdcI2cTimeoutMs = 25;
 constexpr int8_t kDisplayResetPin = -1;
 constexpr uint8_t kDisplayWidth = 128;
 constexpr uint8_t kDisplayHeight = 64;
@@ -71,16 +71,23 @@ constexpr uint16_t kBatteryVoltageNotifyIntervalMs = 1000;
 constexpr uint8_t kBatteryAdcSampleCount = 8;
 constexpr uint8_t kGpsRxPin = 16;
 constexpr uint8_t kGpsTxPin = 17;
+constexpr size_t kGpsSerialRxBufferSize = 8192;
 constexpr uint32_t kGpsBaudRates[] = {115200, 9600, 38400, 57600, 4800};
 constexpr uint8_t kGpsBaudRateCount =
     sizeof(kGpsBaudRates) / sizeof(kGpsBaudRates[0]);
 constexpr uint32_t kGpsTargetBaudRate = 115200;
 constexpr uint32_t kGpsInitialBaudRate = kGpsTargetBaudRate;
+constexpr uint8_t kGpsNavigationRateHz = 10;
+constexpr uint16_t kGpsMeasurementRateMs = 1000 / kGpsNavigationRateHz;
 constexpr uint16_t kGpsFreshAgeMs = 2500;
 constexpr uint16_t kGpsDebugLogIntervalMs = 30000;
 constexpr uint16_t kGpsBaudProbeIntervalMs = 6000;
+constexpr uint16_t kLoopStepWarnMs = 50;
+constexpr uint16_t kLoopWarnMs = 100;
+constexpr uint16_t kLoopDiagnosticsIntervalMs = 5000;
 constexpr uint8_t kGpsDebugRawSampleSize = 96;
 constexpr uint8_t kGpsDebugHexSampleByteCount = 32;
+constexpr uint16_t kGpsUbxMaxPayloadLength = 100;
 constexpr uint16_t kGpsSignalConfigPollTimeoutMs = 700;
 constexpr uint16_t kThrottleZeroCalibrationMs = 1000;
 constexpr uint16_t kThrottleOpenCalibrationPauseMs = 2000;
@@ -120,11 +127,16 @@ constexpr char kThrottleFullPrefsKey[] = "full_v";
 constexpr char kGpsConfigPrefsNamespace[] = "gps";
 constexpr char kGpsGlonassProfilePrefsKey[] = "glo_prof";
 
+constexpr uint8_t kGpsUbxClassNav = 0x01;
 constexpr uint8_t kGpsUbxClassCfg = 0x06;
 constexpr uint8_t kGpsUbxClassAck = 0x05;
 constexpr uint8_t kGpsUbxIdAckNak = 0x00;
 constexpr uint8_t kGpsUbxIdAckAck = 0x01;
 constexpr uint8_t kGpsUbxIdCfgPrt = 0x00;
+constexpr uint8_t kGpsUbxIdCfgMsg = 0x01;
+constexpr uint8_t kGpsUbxIdCfgRate = 0x08;
+constexpr uint8_t kGpsUbxIdNavDop = 0x04;
+constexpr uint8_t kGpsUbxIdNavPvt = 0x07;
 constexpr uint8_t kGpsUbxIdValset = 0x8A;
 constexpr uint8_t kGpsUbxIdValget = 0x8B;
 constexpr uint8_t kGpsUbxValsetLayerRam = 0x01;
@@ -136,7 +148,6 @@ constexpr uint8_t kGpsUbxValsetLayerPersistent =
     kGpsUbxValsetLayerFlash;
 constexpr uint8_t kGpsUbxValgetLayerRam = 0x00;
 constexpr uint16_t kGpsUbxProtocolUbx = 0x0001;
-constexpr uint16_t kGpsUbxProtocolNmea = 0x0002;
 constexpr uint32_t kGpsSignalGpsEnaKey = 0x1031001F;
 constexpr uint32_t kGpsSignalGpsL1CaEnaKey = 0x10310001;
 constexpr uint32_t kGpsSignalSbasEnaKey = 0x10310020;
@@ -149,6 +160,47 @@ constexpr uint32_t kGpsSignalQzssEnaKey = 0x10310024;
 constexpr uint32_t kGpsSignalQzssL1CaEnaKey = 0x10310012;
 constexpr uint32_t kGpsSignalGloEnaKey = 0x10310025;
 constexpr uint32_t kGpsSignalGloL1EnaKey = 0x10310018;
+
+struct GpsNavState {
+  bool locationValid;
+  bool altitudeValid;
+  bool speedValid;
+  bool courseValid;
+  bool timeValid;
+  bool dateValid;
+  bool dopValid;
+  uint32_t pvtUpdatedMs;
+  uint32_t dopUpdatedMs;
+  uint32_t iTowMs;
+  uint16_t year;
+  uint8_t month;
+  uint8_t day;
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+  uint8_t fixType;
+  uint8_t flags;
+  uint8_t numSv;
+  int32_t lonDeg1e7;
+  int32_t latDeg1e7;
+  int32_t heightMslMm;
+  int32_t groundSpeedMmps;
+  int32_t headingMotionDeg1e5;
+  uint16_t hDopCentis;
+};
+
+struct GpsUbxStreamParser {
+  uint8_t state;
+  uint8_t messageClass;
+  uint8_t messageId;
+  uint8_t checksumA;
+  uint8_t checksumB;
+  uint8_t expectedChecksumA;
+  uint16_t payloadLength;
+  uint16_t payloadIndex;
+  bool tooLong;
+  uint8_t payload[kGpsUbxMaxPayloadLength];
+};
 
 BLEServer *bleServer = nullptr;
 BLECharacteristic *canMainCharacteristic = nullptr;
@@ -164,8 +216,8 @@ Adafruit_SSD1306 display(kDisplayWidth,
                          &Wire,
                          kDisplayResetPin);
 HardwareSerial gpsSerial(2);
-TinyGPSPlus gps;
-TinyGPSCustom gpsGgaFixQuality(gps, "GPGGA", 6);
+GpsNavState gpsNav = {};
+GpsUbxStreamParser gpsUbxStreamParser = {};
 
 bool bleClientConnected = false;
 bool bleWasConnected = false;
@@ -189,13 +241,24 @@ uint32_t lastBatteryAdcReadMs = 0;
 uint32_t lastBatteryVoltageNotifyMs = 0;
 uint32_t lastAfrAdcReadMs = 0;
 uint32_t lastGpsDebugLogMs = 0;
-uint32_t lastGpsDebugCharsProcessed = 0;
-uint32_t lastGpsDebugPassedChecksum = 0;
-uint32_t lastGpsDebugFailedChecksum = 0;
-uint32_t lastGpsDebugSentencesWithFix = 0;
+uint32_t lastGpsDebugBytesProcessed = 0;
+uint32_t lastGpsDebugValidUbxPackets = 0;
+uint32_t lastGpsDebugChecksumFailures = 0;
+uint32_t lastGpsDebugPvtPackets = 0;
+uint32_t lastGpsDebugDopPackets = 0;
 uint32_t lastGpsBaudProbeMs = 0;
-uint32_t lastGpsBaudProbePassedChecksum = 0;
+uint32_t lastGpsBaudProbePvtPackets = 0;
+uint32_t lastLoopDiagnosticsMs = 0;
+uint32_t maxLoopDurationMs = 0;
+uint32_t slowLoopCount = 0;
 uint32_t gpsCurrentBaudRate = kGpsInitialBaudRate;
+uint32_t gpsUbxBytesProcessed = 0;
+uint32_t gpsUbxValidPacketCount = 0;
+uint32_t gpsUbxChecksumFailureCount = 0;
+uint32_t gpsUbxUnexpectedPacketCount = 0;
+uint32_t gpsUbxTooLongPacketCount = 0;
+uint32_t gpsUbxPvtPacketCount = 0;
+uint32_t gpsUbxDopPacketCount = 0;
 uint16_t gpsDebugDollarCount = 0;
 uint16_t gpsDebugStarCount = 0;
 uint16_t gpsDebugLineFeedCount = 0;
@@ -247,6 +310,7 @@ bool ledSensorActive = false;
 bool displayReady = false;
 bool gpsMainDirty = true;
 bool gpsTimeDirty = true;
+bool gpsSynchronizedCanSnapshotPending = false;
 bool gpsDateHourInitialized = false;
 bool gpsLocationWasFresh = false;
 bool gpsAltitudeWasFresh = false;
@@ -257,6 +321,11 @@ bool gpsDateWasFresh = false;
 
 uint16_t readUint16Be(const uint8_t *data) {
   return (static_cast<uint16_t>(data[0]) << 8) | data[1];
+}
+
+uint16_t readUint16Le(const uint8_t *data) {
+  return static_cast<uint16_t>(data[0]) |
+         (static_cast<uint16_t>(data[1]) << 8);
 }
 
 uint32_t readUint32Be(const uint8_t *data) {
@@ -271,6 +340,15 @@ uint32_t readUint32Le(const uint8_t *data) {
          (static_cast<uint32_t>(data[1]) << 8) |
          (static_cast<uint32_t>(data[2]) << 16) |
          (static_cast<uint32_t>(data[3]) << 24);
+}
+
+int32_t readInt32Le(const uint8_t *data) {
+  return static_cast<int32_t>(readUint32Le(data));
+}
+
+void writeUint16Le(uint8_t *data, uint16_t value) {
+  data[0] = static_cast<uint8_t>(value & 0xFF);
+  data[1] = static_cast<uint8_t>(value >> 8);
 }
 
 void writeUint16Be(uint8_t *data, uint16_t value) {
@@ -1216,7 +1294,6 @@ GpsUbxPollResult readGpsUbxPacket(uint8_t expectedClass,
       if (stats != nullptr) {
         ++stats->bytesRead;
       }
-      gps.encode(static_cast<char>(value));
 
       switch (state) {
         case 0:
@@ -1572,10 +1649,7 @@ void logAndEnableGpsGlonassIfNeeded() {
   }
 }
 
-void sendGpsUbxSetUartNmea(bool enableUbxOutput = false) {
-  const uint16_t outputProtocols =
-      enableUbxOutput ? (kGpsUbxProtocolUbx | kGpsUbxProtocolNmea)
-                      : kGpsUbxProtocolNmea;
+void sendGpsUbxSetUartProtocols(uint16_t outputProtocols) {
   uint8_t payload[] = {
       0x01, 0x00,              // UART1
       0x00, 0x00,              // txReady disabled
@@ -1590,7 +1664,33 @@ void sendGpsUbxSetUartNmea(bool enableUbxOutput = false) {
   payload[14] = static_cast<uint8_t>(outputProtocols & 0xFF);
   payload[15] = static_cast<uint8_t>(outputProtocols >> 8);
 
-  writeGpsUbxPacket(0x06, 0x00, payload, sizeof(payload));
+  writeGpsUbxPacket(kGpsUbxClassCfg, kGpsUbxIdCfgPrt, payload, sizeof(payload));
+}
+
+void sendGpsUbxSetNavigationRate10Hz() {
+  uint8_t payload[6] = {};
+  writeUint16Le(payload, kGpsMeasurementRateMs);
+  writeUint16Le(payload + 2, 1);     // navigation solution every measurement
+  writeUint16Le(payload + 4, 0);     // UTC time reference
+
+  writeGpsUbxPacket(kGpsUbxClassCfg, kGpsUbxIdCfgRate, payload, sizeof(payload));
+}
+
+void sendGpsUbxSetMessageRate(uint8_t messageClass,
+                              uint8_t messageId,
+                              uint8_t uartRate) {
+  uint8_t payload[] = {
+      messageClass,
+      messageId,
+      0x00,      // I2C/DDC
+      uartRate,  // UART1
+      0x00,      // UART2
+      0x00,      // USB
+      0x00,      // SPI
+      0x00       // reserved
+  };
+
+  writeGpsUbxPacket(kGpsUbxClassCfg, kGpsUbxIdCfgMsg, payload, sizeof(payload));
 }
 
 void beginGpsSerial(uint32_t baudRate) {
@@ -1599,9 +1699,9 @@ void beginGpsSerial(uint32_t baudRate) {
 }
 
 void configureGpsAtCurrentBaud(const char *reason, bool logCommand = true) {
-  sendGpsUbxSetUartNmea();
+  sendGpsUbxSetUartProtocols(kGpsUbxProtocolUbx);
   if (logCommand) {
-    Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target NMEA %lu baud, output=NMEA (%s)\n",
+    Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target UBX %lu baud, output=UBX (%s)\n",
                   static_cast<unsigned long>(gpsCurrentBaudRate),
                   static_cast<unsigned long>(kGpsTargetBaudRate),
                   reason);
@@ -1617,29 +1717,59 @@ void configureGpsAtCommonBaudRates(const char *reason) {
   for (uint8_t i = 0; i < kGpsBaudRateCount; ++i) {
     beginGpsSerial(kGpsBaudRates[i]);
     delay(50);
-    sendGpsUbxSetUartNmea();
+    sendGpsUbxSetUartProtocols(kGpsUbxProtocolUbx);
   }
 
   beginGpsSerial(kGpsTargetBaudRate);
-  Serial.printf("GPS config: sent UBX-CFG-PRT at %u common baud rates, target NMEA %lu baud, output=NMEA (%s)\n",
+  Serial.printf("GPS config: sent UBX-CFG-PRT at %u common baud rates, target UBX %lu baud, output=UBX (%s)\n",
                 kGpsBaudRateCount,
                 static_cast<unsigned long>(kGpsTargetBaudRate),
                 reason);
 }
 
-void enableGpsUbxOutputForDiagnostics() {
-  sendGpsUbxSetUartNmea(true);
-  Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target NMEA %lu baud, output=UBX+NMEA (diagnostics)\n",
-                static_cast<unsigned long>(gpsCurrentBaudRate),
-                static_cast<unsigned long>(kGpsTargetBaudRate));
-  delay(50);
+void logGpsConfigAck(const char *commandName,
+                     uint8_t targetClass,
+                     uint8_t targetId,
+                     const char *reason) {
+  GpsUbxPollStats stats = {};
+  const bool acknowledged = waitGpsUbxAck(targetClass, targetId, 700, stats);
+  Serial.printf("GPS config: %s ack=%s (%s; ",
+                commandName,
+                acknowledged ? "yes" : "no",
+                reason);
+  printGpsUbxPollStats(stats);
+  Serial.println(")");
 }
 
-void restoreGpsNmeaOnlyOutput() {
-  sendGpsUbxSetUartNmea();
-  Serial.printf("GPS config: sent UBX-CFG-PRT at %lu baud, target NMEA %lu baud, output=NMEA (diagnostics done)\n",
+void configureGpsRuntimeUbxMessages(const char *reason, bool waitForAck = true) {
+  sendGpsUbxSetNavigationRate10Hz();
+  if (waitForAck) {
+    logGpsConfigAck("UBX-CFG-RATE 10Hz",
+                    kGpsUbxClassCfg,
+                    kGpsUbxIdCfgRate,
+                    reason);
+  }
+
+  sendGpsUbxSetMessageRate(kGpsUbxClassNav, kGpsUbxIdNavPvt, 1);
+  if (waitForAck) {
+    logGpsConfigAck("UBX-CFG-MSG NAV-PVT UART1",
+                    kGpsUbxClassCfg,
+                    kGpsUbxIdCfgMsg,
+                    reason);
+  }
+
+  sendGpsUbxSetMessageRate(kGpsUbxClassNav, kGpsUbxIdNavDop, 1);
+  if (waitForAck) {
+    logGpsConfigAck("UBX-CFG-MSG NAV-DOP UART1",
+                    kGpsUbxClassCfg,
+                    kGpsUbxIdCfgMsg,
+                    reason);
+  }
+
+  Serial.printf("GPS config: native UBX NAV-PVT/NAV-DOP enabled at %uHz, baud=%lu (%s)\n",
+                kGpsNavigationRateHz,
                 static_cast<unsigned long>(gpsCurrentBaudRate),
-                static_cast<unsigned long>(kGpsTargetBaudRate));
+                reason);
 }
 
 void startGps() {
@@ -1654,9 +1784,8 @@ void startGps() {
                 kGpsTxPin,
                 static_cast<unsigned long>(gpsCurrentBaudRate));
   configureGpsAtCommonBaudRates("startup");
-  enableGpsUbxOutputForDiagnostics();
   logAndEnableGpsGlonassIfNeeded();
-  restoreGpsNmeaOnlyOutput();
+  configureGpsRuntimeUbxMessages("startup");
 }
 
 void formatDisplayAdsVoltageLine(char *line,
@@ -1786,27 +1915,43 @@ uint16_t afrToCentiAfr(float afr) {
 }
 
 bool isGpsLocationFresh() {
-  return gps.location.isValid() && gps.location.age() <= kGpsFreshAgeMs;
+  return gpsNav.locationValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
+}
+
+bool isGpsPvtFresh() {
+  return gpsUbxPvtPacketCount > 0 &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
 }
 
 bool isGpsAltitudeFresh() {
-  return gps.altitude.isValid() && gps.altitude.age() <= kGpsFreshAgeMs;
+  return gpsNav.altitudeValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
 }
 
 bool isGpsSpeedFresh() {
-  return gps.speed.isValid() && gps.speed.age() <= kGpsFreshAgeMs;
+  return gpsNav.speedValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
 }
 
 bool isGpsCourseFresh() {
-  return gps.course.isValid() && gps.course.age() <= kGpsFreshAgeMs;
+  return gpsNav.courseValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
 }
 
 bool isGpsTimeFresh() {
-  return gps.time.isValid() && gps.time.age() <= kGpsFreshAgeMs;
+  return gpsNav.timeValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
 }
 
 bool isGpsDateFresh() {
-  return gps.date.isValid() && gps.date.age() <= kGpsFreshAgeMs;
+  return gpsNav.dateValid &&
+         millis() - gpsNav.pvtUpdatedMs <= kGpsFreshAgeMs;
+}
+
+bool isGpsDopFresh() {
+  return gpsNav.dopValid &&
+         millis() - gpsNav.dopUpdatedMs <= kGpsFreshAgeMs;
 }
 
 void formatGpsUnsigned(char *buffer,
@@ -1836,18 +1981,22 @@ void formatGpsFloat(char *buffer,
   snprintf(buffer, bufferSize, format, value);
 }
 
-const char *gpsDebugState(uint32_t charsDelta,
-                          uint32_t passedDelta,
-                          uint32_t failedDelta,
-                          uint16_t ubxHeaderCount) {
-  if (charsDelta == 0) {
+const char *gpsDebugState(uint32_t bytesDelta,
+                          uint32_t validUbxDelta,
+                          uint32_t checksumFailureDelta,
+                          uint32_t pvtDelta,
+                          uint16_t dollarCount) {
+  if (bytesDelta == 0) {
     return "no_uart";
   }
-  if (ubxHeaderCount > 0 && passedDelta == 0) {
-    return "ubx_binary";
+  if (validUbxDelta == 0 && dollarCount > 0) {
+    return "nmea_output";
   }
-  if (passedDelta == 0 && failedDelta > 0) {
-    return "bad_nmea";
+  if (validUbxDelta == 0 && checksumFailureDelta > 0) {
+    return "bad_ubx";
+  }
+  if (pvtDelta == 0) {
+    return "no_nav_pvt";
   }
   if (!isGpsLocationFresh()) {
     return "no_fix";
@@ -1903,13 +2052,174 @@ void captureGpsDebugByte(char value) {
   gpsDebugRawSample[gpsDebugRawSampleLength] = '\0';
 }
 
+bool isGpsPvtLocationValid(uint8_t fixType, uint8_t flags) {
+  const bool gnssFixOk = (flags & 0x01) != 0;
+  return gnssFixOk && (fixType == 2 || fixType == 3 || fixType == 4);
+}
+
+void updateGpsFromNavPvt(const uint8_t *payload, uint16_t payloadLength) {
+  if (payloadLength < 92) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const uint8_t valid = payload[11];
+  const uint8_t fixType = payload[20];
+  const uint8_t flags = payload[21];
+  const bool locationValid = isGpsPvtLocationValid(fixType, flags);
+
+  gpsNav.pvtUpdatedMs = now;
+  gpsNav.iTowMs = readUint32Le(payload);
+  gpsNav.year = readUint16Le(payload + 4);
+  gpsNav.month = payload[6];
+  gpsNav.day = payload[7];
+  gpsNav.hour = payload[8];
+  gpsNav.minute = payload[9];
+  gpsNav.second = payload[10];
+  gpsNav.fixType = fixType;
+  gpsNav.flags = flags;
+  gpsNav.numSv = payload[23];
+  gpsNav.lonDeg1e7 = readInt32Le(payload + 24);
+  gpsNav.latDeg1e7 = readInt32Le(payload + 28);
+  gpsNav.heightMslMm = readInt32Le(payload + 36);
+  gpsNav.groundSpeedMmps = readInt32Le(payload + 60);
+  gpsNav.headingMotionDeg1e5 = readInt32Le(payload + 64);
+  gpsNav.locationValid = locationValid;
+  gpsNav.altitudeValid = locationValid && (fixType == 3 || fixType == 4);
+  gpsNav.speedValid = locationValid;
+  gpsNav.courseValid = locationValid;
+  gpsNav.dateValid = (valid & 0x01) != 0;
+  gpsNav.timeValid = (valid & 0x02) != 0;
+
+  ++gpsUbxPvtPacketCount;
+  gpsMainDirty = true;
+  gpsSynchronizedCanSnapshotPending = true;
+}
+
+void updateGpsFromNavDop(const uint8_t *payload, uint16_t payloadLength) {
+  if (payloadLength < 18) {
+    return;
+  }
+
+  gpsNav.hDopCentis = readUint16Le(payload + 12);
+  gpsNav.dopUpdatedMs = millis();
+  gpsNav.dopValid = true;
+  ++gpsUbxDopPacketCount;
+}
+
+void handleGpsUbxFrame(uint8_t messageClass,
+                       uint8_t messageId,
+                       const uint8_t *payload,
+                       uint16_t payloadLength,
+                       bool tooLong) {
+  ++gpsUbxValidPacketCount;
+
+  if (tooLong) {
+    ++gpsUbxTooLongPacketCount;
+    return;
+  }
+
+  if (messageClass == kGpsUbxClassNav && messageId == kGpsUbxIdNavPvt) {
+    updateGpsFromNavPvt(payload, payloadLength);
+    return;
+  }
+
+  if (messageClass == kGpsUbxClassNav && messageId == kGpsUbxIdNavDop) {
+    updateGpsFromNavDop(payload, payloadLength);
+    return;
+  }
+
+  ++gpsUbxUnexpectedPacketCount;
+}
+
+void processGpsUbxByte(uint8_t value) {
+  ++gpsUbxBytesProcessed;
+
+  switch (gpsUbxStreamParser.state) {
+    case 0:
+      gpsUbxStreamParser.state = (value == 0xB5) ? 1 : 0;
+      break;
+    case 1:
+      if (value == 0x62) {
+        gpsUbxStreamParser.state = 2;
+      } else {
+        gpsUbxStreamParser.state = (value == 0xB5) ? 1 : 0;
+      }
+      break;
+    case 2:
+      gpsUbxStreamParser.messageClass = value;
+      gpsUbxStreamParser.checksumA = 0;
+      gpsUbxStreamParser.checksumB = 0;
+      updateGpsUbxChecksum(value,
+                           gpsUbxStreamParser.checksumA,
+                           gpsUbxStreamParser.checksumB);
+      gpsUbxStreamParser.state = 3;
+      break;
+    case 3:
+      gpsUbxStreamParser.messageId = value;
+      updateGpsUbxChecksum(value,
+                           gpsUbxStreamParser.checksumA,
+                           gpsUbxStreamParser.checksumB);
+      gpsUbxStreamParser.state = 4;
+      break;
+    case 4:
+      gpsUbxStreamParser.payloadLength = value;
+      updateGpsUbxChecksum(value,
+                           gpsUbxStreamParser.checksumA,
+                           gpsUbxStreamParser.checksumB);
+      gpsUbxStreamParser.state = 5;
+      break;
+    case 5:
+      gpsUbxStreamParser.payloadLength |= static_cast<uint16_t>(value) << 8;
+      gpsUbxStreamParser.payloadIndex = 0;
+      gpsUbxStreamParser.tooLong =
+          gpsUbxStreamParser.payloadLength > kGpsUbxMaxPayloadLength;
+      updateGpsUbxChecksum(value,
+                           gpsUbxStreamParser.checksumA,
+                           gpsUbxStreamParser.checksumB);
+      gpsUbxStreamParser.state =
+          (gpsUbxStreamParser.payloadLength == 0) ? 7 : 6;
+      break;
+    case 6:
+      updateGpsUbxChecksum(value,
+                           gpsUbxStreamParser.checksumA,
+                           gpsUbxStreamParser.checksumB);
+      if (!gpsUbxStreamParser.tooLong) {
+        gpsUbxStreamParser.payload[gpsUbxStreamParser.payloadIndex] = value;
+      }
+      ++gpsUbxStreamParser.payloadIndex;
+      if (gpsUbxStreamParser.payloadIndex >= gpsUbxStreamParser.payloadLength) {
+        gpsUbxStreamParser.state = 7;
+      }
+      break;
+    case 7:
+      gpsUbxStreamParser.expectedChecksumA = value;
+      gpsUbxStreamParser.state = 8;
+      break;
+    case 8:
+      if (gpsUbxStreamParser.expectedChecksumA == gpsUbxStreamParser.checksumA &&
+          value == gpsUbxStreamParser.checksumB) {
+        handleGpsUbxFrame(gpsUbxStreamParser.messageClass,
+                          gpsUbxStreamParser.messageId,
+                          gpsUbxStreamParser.payload,
+                          gpsUbxStreamParser.payloadLength,
+                          gpsUbxStreamParser.tooLong);
+      } else {
+        ++gpsUbxChecksumFailureCount;
+      }
+      gpsUbxStreamParser.state = 0;
+      break;
+    default:
+      gpsUbxStreamParser.state = 0;
+      break;
+  }
+}
+
 void updateGpsBaudProbe(uint32_t now) {
-  const uint32_t passedChecksum = gps.passedChecksum();
-  if (passedChecksum > 0) {
-    if (passedChecksum != lastGpsBaudProbePassedChecksum) {
-      lastGpsBaudProbePassedChecksum = passedChecksum;
-      lastGpsBaudProbeMs = now;
-    }
+  const uint32_t pvtPackets = gpsUbxPvtPacketCount;
+  if (pvtPackets != lastGpsBaudProbePvtPackets) {
+    lastGpsBaudProbePvtPackets = pvtPackets;
+    lastGpsBaudProbeMs = now;
     return;
   }
 
@@ -1922,6 +2232,7 @@ void updateGpsBaudProbe(uint32_t now) {
   beginGpsSerial(probeBaudRate);
   delay(50);
   configureGpsAtCurrentBaud("baud probe", false);
+  configureGpsRuntimeUbxMessages("baud probe", false);
   gpsCurrentBaudRateIndex =
       (gpsCurrentBaudRateIndex + 1) % kGpsBaudRateCount;
 }
@@ -1931,9 +2242,9 @@ uint32_t gpsTimeFromHourStart() {
     return 0;
   }
 
-  return static_cast<uint32_t>(gps.time.minute()) * 30000UL +
-         static_cast<uint32_t>(gps.time.second()) * 500UL +
-         static_cast<uint32_t>(gps.time.centisecond()) * 5UL;
+  return static_cast<uint32_t>(gpsNav.minute) * 30000UL +
+         static_cast<uint32_t>(gpsNav.second) * 500UL +
+         (gpsNav.iTowMs % 1000UL) / 2UL;
 }
 
 uint32_t gpsDateHourValue() {
@@ -1942,12 +2253,12 @@ uint32_t gpsDateHourValue() {
   }
 
   const uint16_t year =
-      static_cast<uint16_t>(constrain(gps.date.year(), 2000, 2099));
+      static_cast<uint16_t>(constrain(gpsNav.year, 2000, 2099));
   const uint8_t month =
-      static_cast<uint8_t>(constrain(gps.date.month(), 1, 12));
+      static_cast<uint8_t>(constrain(gpsNav.month, 1, 12));
   const uint8_t day =
-      static_cast<uint8_t>(constrain(gps.date.day(), 1, 31));
-  const uint8_t hour = min<uint8_t>(gps.time.hour(), 23);
+      static_cast<uint8_t>(constrain(gpsNav.day, 1, 31));
+  const uint8_t hour = min<uint8_t>(gpsNav.hour, 23);
 
   return static_cast<uint32_t>(year - 2000) * 8928UL +
          static_cast<uint32_t>(month - 1) * 744UL +
@@ -2000,33 +2311,37 @@ void updateGpsFreshnessState() {
 }
 
 uint8_t gpsFixQuality() {
-  if (gpsGgaFixQuality.isValid() && gpsGgaFixQuality.age() <= kGpsFreshAgeMs) {
-    return min<uint8_t>(static_cast<uint8_t>(atoi(gpsGgaFixQuality.value())), 3);
+  if (!isGpsLocationFresh()) {
+    return 0;
   }
 
-  return isGpsLocationFresh() ? 1 : 0;
+  const uint8_t carrierSolution = (gpsNav.flags >> 6) & 0x03;
+  if (carrierSolution > 0) {
+    return 3;
+  }
+
+  if ((gpsNav.flags & 0x02) != 0) {
+    return 2;
+  }
+
+  return 1;
 }
 
 uint8_t gpsLockedSatellites() {
-  if (!gps.satellites.isValid() || gps.satellites.age() > kGpsFreshAgeMs) {
+  if (!isGpsPvtFresh()) {
     return 0x3F;
   }
 
-  return min<uint8_t>(static_cast<uint8_t>(gps.satellites.value()), 0x3E);
+  return min<uint8_t>(gpsNav.numSv, 0x3E);
 }
 
 uint8_t gpsHdopRaw() {
-  if (!gps.hdop.isValid() || gps.hdop.age() > kGpsFreshAgeMs) {
+  if (!isGpsDopFresh()) {
     return 0xFF;
   }
 
-  const long hdopTenths = lround(gps.hdop.hdop() * 10.0);
+  const long hdopTenths = (static_cast<long>(gpsNav.hDopCentis) + 5L) / 10L;
   return static_cast<uint8_t>(constrain(hdopTenths, 0L, 0xFEL));
-}
-
-uint32_t gpsLatLonRaw(double degrees) {
-  return static_cast<uint32_t>(static_cast<int32_t>(
-      llround(degrees * 10000000.0)));
 }
 
 uint16_t gpsAltitudeRaw() {
@@ -2034,7 +2349,7 @@ uint16_t gpsAltitudeRaw() {
     return 0xFFFF;
   }
 
-  const double meters = gps.altitude.meters();
+  const double meters = static_cast<double>(gpsNav.heightMslMm) / 1000.0;
   const double shiftedMeters = meters + 500.0;
   if (shiftedMeters >= 0.0 && shiftedMeters <= 6053.5) {
     return static_cast<uint16_t>(llround(shiftedMeters * 10.0)) & 0x7FFF;
@@ -2048,7 +2363,8 @@ uint16_t gpsSpeedRaw() {
     return 0xFFFF;
   }
 
-  const double speedKmph = max(0.0, gps.speed.kmph());
+  const double speedKmph =
+      max(0.0, static_cast<double>(gpsNav.groundSpeedMmps) * 0.0036);
   if (speedKmph <= 655.35) {
     return static_cast<uint16_t>(llround(speedKmph * 100.0)) & 0x7FFF;
   }
@@ -2061,7 +2377,8 @@ uint16_t gpsBearingRaw() {
     return 0xFFFF;
   }
 
-  double bearingDegrees = fmod(gps.course.deg(), 360.0);
+  double bearingDegrees =
+      fmod(static_cast<double>(gpsNav.headingMotionDeg1e5) / 100000.0, 360.0);
   if (bearingDegrees < 0.0) {
     bearingDegrees += 360.0;
   }
@@ -2080,8 +2397,8 @@ void buildGpsMainPacket(uint8_t *packet) {
                                    (gpsLockedSatellites() & 0x3F));
 
   if (isGpsLocationFresh()) {
-    writeUint32Be(packet + 4, gpsLatLonRaw(gps.location.lat()));
-    writeUint32Be(packet + 8, gpsLatLonRaw(gps.location.lng()));
+    writeUint32Be(packet + 4, static_cast<uint32_t>(gpsNav.latDeg1e7));
+    writeUint32Be(packet + 8, static_cast<uint32_t>(gpsNav.lonDeg1e7));
   } else {
     writeUint32Be(packet + 4, 0x7FFFFFFFUL);
     writeUint32Be(packet + 8, 0x7FFFFFFFUL);
@@ -2140,23 +2457,27 @@ void printGpsDebugLog(uint32_t now) {
 
   lastGpsDebugLogMs = now;
 
-  const uint32_t charsProcessed = gps.charsProcessed();
-  const uint32_t passedChecksum = gps.passedChecksum();
-  const uint32_t failedChecksum = gps.failedChecksum();
-  const uint32_t sentencesWithFix = gps.sentencesWithFix();
-  const uint32_t charsDelta = charsProcessed - lastGpsDebugCharsProcessed;
-  const uint32_t passedDelta = passedChecksum - lastGpsDebugPassedChecksum;
-  const uint32_t failedDelta = failedChecksum - lastGpsDebugFailedChecksum;
-  const uint32_t fixDelta = sentencesWithFix - lastGpsDebugSentencesWithFix;
+  const uint32_t bytesProcessed = gpsUbxBytesProcessed;
+  const uint32_t validUbxPackets = gpsUbxValidPacketCount;
+  const uint32_t checksumFailures = gpsUbxChecksumFailureCount;
+  const uint32_t pvtPackets = gpsUbxPvtPacketCount;
+  const uint32_t dopPackets = gpsUbxDopPacketCount;
+  const uint32_t bytesDelta = bytesProcessed - lastGpsDebugBytesProcessed;
+  const uint32_t validDelta = validUbxPackets - lastGpsDebugValidUbxPackets;
+  const uint32_t checksumFailureDelta =
+      checksumFailures - lastGpsDebugChecksumFailures;
+  const uint32_t pvtDelta = pvtPackets - lastGpsDebugPvtPackets;
+  const uint32_t dopDelta = dopPackets - lastGpsDebugDopPackets;
   const uint16_t dollarCount = gpsDebugDollarCount;
   const uint16_t starCount = gpsDebugStarCount;
   const uint16_t lineFeedCount = gpsDebugLineFeedCount;
   const uint16_t ubxHeaderCount = gpsDebugUbxHeaderCount;
 
-  lastGpsDebugCharsProcessed = charsProcessed;
-  lastGpsDebugPassedChecksum = passedChecksum;
-  lastGpsDebugFailedChecksum = failedChecksum;
-  lastGpsDebugSentencesWithFix = sentencesWithFix;
+  lastGpsDebugBytesProcessed = bytesProcessed;
+  lastGpsDebugValidUbxPackets = validUbxPackets;
+  lastGpsDebugChecksumFailures = checksumFailures;
+  lastGpsDebugPvtPackets = pvtPackets;
+  lastGpsDebugDopPackets = dopPackets;
 
   char satellites[8] = {};
   char hdop[8] = {};
@@ -2166,70 +2487,70 @@ void printGpsDebugLog(uint32_t now) {
   char course[12] = {};
   formatGpsUnsigned(satellites,
                     sizeof(satellites),
-                    gps.satellites.isValid(),
-                    gps.satellites.value());
+                    isGpsPvtFresh(),
+                    gpsNav.numSv);
   formatGpsFloat(hdop,
                  sizeof(hdop),
-                 gps.hdop.isValid(),
-                 gps.hdop.hdop(),
+                 isGpsDopFresh(),
+                 static_cast<double>(gpsNav.hDopCentis) / 100.0,
                  1);
   formatGpsFloat(latitude,
                  sizeof(latitude),
                  isGpsLocationFresh(),
-                 gps.location.lat(),
+                 static_cast<double>(gpsNav.latDeg1e7) / 10000000.0,
                  7);
   formatGpsFloat(longitude,
                  sizeof(longitude),
                  isGpsLocationFresh(),
-                 gps.location.lng(),
+                 static_cast<double>(gpsNav.lonDeg1e7) / 10000000.0,
                  7);
   formatGpsFloat(speed,
                  sizeof(speed),
                  isGpsSpeedFresh(),
-                 gps.speed.kmph(),
+                 static_cast<double>(gpsNav.groundSpeedMmps) * 0.0036,
                  2);
   formatGpsFloat(course,
                  sizeof(course),
                  isGpsCourseFresh(),
-                 gps.course.deg(),
+                 static_cast<double>(gpsNav.headingMotionDeg1e5) / 100000.0,
                  2);
 
   const char *state =
-      gpsDebugState(charsDelta, passedDelta, failedDelta, ubxHeaderCount);
-  if (passedChecksum > 0) {
-    Serial.printf(
-        "GPS diag state=%s baud=%lu ok=%lu (+%lu), fix_sent=%lu (+%lu), used=%s, hdop=%s, lat=%s, lon=%s, speed=%s km/h, course=%s deg\n",
-        state,
-        static_cast<unsigned long>(gpsCurrentBaudRate),
-        static_cast<unsigned long>(passedChecksum),
-        static_cast<unsigned long>(passedDelta),
-        static_cast<unsigned long>(sentencesWithFix),
-        static_cast<unsigned long>(fixDelta),
-        satellites,
-        hdop,
-        latitude,
-        longitude,
-        speed,
-        course);
-  } else {
-    Serial.printf(
-        "GPS diag state=%s RX=GPIO%u baud=%lu chars=%lu (+%lu), ok=%lu (+%lu), checksum_fail=%lu (+%lu), $=%u, *=%u, lf=%u, ubx=%u, raw=\"%s\", hex=\"%s\"\n",
-        state,
-        kGpsRxPin,
-        static_cast<unsigned long>(gpsCurrentBaudRate),
-        static_cast<unsigned long>(charsProcessed),
-        static_cast<unsigned long>(charsDelta),
-        static_cast<unsigned long>(passedChecksum),
-        static_cast<unsigned long>(passedDelta),
-        static_cast<unsigned long>(failedChecksum),
-        static_cast<unsigned long>(failedDelta),
-        dollarCount,
-        starCount,
-        lineFeedCount,
-        ubxHeaderCount,
-        gpsDebugRawSample,
-        gpsDebugHexSample);
-  }
+      gpsDebugState(bytesDelta,
+                    validDelta,
+                    checksumFailureDelta,
+                    pvtDelta,
+                    dollarCount);
+  Serial.printf(
+      "GPS diag state=%s RX=GPIO%u baud=%lu bytes=%lu (+%lu), ubx=%lu (+%lu), pvt=%lu (+%lu), dop=%lu (+%lu), checksum_fail=%lu (+%lu), too_long=%lu, other=%lu, fix_type=%u, used=%s, hdop=%s, lat=%s, lon=%s, speed=%s km/h, course=%s deg, $=%u, *=%u, lf=%u, headers=%u, raw=\"%s\", hex=\"%s\"\n",
+      state,
+      kGpsRxPin,
+      static_cast<unsigned long>(gpsCurrentBaudRate),
+      static_cast<unsigned long>(bytesProcessed),
+      static_cast<unsigned long>(bytesDelta),
+      static_cast<unsigned long>(validUbxPackets),
+      static_cast<unsigned long>(validDelta),
+      static_cast<unsigned long>(pvtPackets),
+      static_cast<unsigned long>(pvtDelta),
+      static_cast<unsigned long>(dopPackets),
+      static_cast<unsigned long>(dopDelta),
+      static_cast<unsigned long>(checksumFailures),
+      static_cast<unsigned long>(checksumFailureDelta),
+      static_cast<unsigned long>(gpsUbxTooLongPacketCount),
+      static_cast<unsigned long>(gpsUbxUnexpectedPacketCount),
+      gpsNav.fixType,
+      satellites,
+      hdop,
+      latitude,
+      longitude,
+      speed,
+      course,
+      dollarCount,
+      starCount,
+      lineFeedCount,
+      ubxHeaderCount,
+      gpsDebugRawSample,
+      gpsDebugHexSample);
 
   gpsDebugDollarCount = 0;
   gpsDebugStarCount = 0;
@@ -2243,11 +2564,9 @@ void printGpsDebugLog(uint32_t now) {
 
 void updateGpsFromSerial(uint32_t now) {
   while (gpsSerial.available() > 0) {
-    const char value = static_cast<char>(gpsSerial.read());
-    captureGpsDebugByte(value);
-    if (gps.encode(value)) {
-      gpsMainDirty = true;
-    }
+    const uint8_t value = static_cast<uint8_t>(gpsSerial.read());
+    captureGpsDebugByte(static_cast<char>(value));
+    processGpsUbxByte(value);
   }
 
   updateGpsFreshnessState();
@@ -2331,6 +2650,22 @@ void printBleTxLog(uint32_t now,
         batteryVolts,
         afr);
   }
+}
+
+bool publishGpsSynchronizedCanSnapshot(uint32_t now) {
+  if (!gpsSynchronizedCanSnapshotPending) {
+    return false;
+  }
+
+  gpsSynchronizedCanSnapshotPending = false;
+  if (!canSendBleNotification(canMainNotifyDescriptor)) {
+    return false;
+  }
+
+  publishFastTelemetry(brakePressureBar, throttlePercent, afr);
+  lastCanNotifyMs = now;
+  printBleTxLog(now, brakePressureBar, throttlePercent, batteryVolts, afr);
+  return true;
 }
 
 class RaceChronoServerCallbacks : public BLEServerCallbacks {
@@ -2499,6 +2834,7 @@ void loop() {
   updateAfrFromAdc(now);
   updateBatteryFromAdc(now);
   updateGpsFromSerial(now);
+  publishGpsSynchronizedCanSnapshot(now);
   updateLedIdleBlink(now);
   updateDisplay(now);
 
