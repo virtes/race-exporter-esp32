@@ -1,4 +1,4 @@
-# racechrono-collector-esp32
+# race-exporter-esp32
 
 ESP32-прошивка под PlatformIO для отправки телеметрии в RaceChrono через BLE
 DIY API: датчики идут через CAN-Bus feature, GPS идет через GPS feature.

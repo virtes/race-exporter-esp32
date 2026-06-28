@@ -3171,7 +3171,7 @@ void setup() {
   setLed(false);
 
   Serial.println();
-  Serial.println("racechrono-collector-esp32 started");
+  Serial.println("race-exporter-esp32 started");
   Serial.printf(
       "RaceChrono BLE CAN PID 0x%08lX: telemetry, brake@0 centibar, throttle@2 centipercent, AFR@4 centi-AFR, battery@6 millivolts\n",
       static_cast<unsigned long>(kTelemetryPid));
